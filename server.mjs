@@ -12,7 +12,7 @@ app.use(express.json({ limit: "2mb" }));
 
 /* -------------------- config -------------------- */
 
-const SERVICE_NAME = process.env.SERVICE_NAME?.trim() || "cl-fetch-live";
+const SERVICE_NAME = process.env.SERVICE_NAME?.trim() || "commandlayer-runtime";
 const ENS_NAME = process.env.ENS_NAME?.trim() || null;
 const ETH_RPC_URL = process.env.ETH_RPC_URL?.trim() || null;
 
@@ -35,24 +35,33 @@ function sha256Hex(s) {
 }
 
 function canonicalJson(obj) {
-  // v1: stable-enough canonicalization
+  // v1: stable-enough canonicalization (property order is insertion order)
   return JSON.stringify(obj);
 }
 
 function readPemB64Env(name) {
   const b64 = process.env[name]?.trim();
   if (!b64) return null;
-  return Buffer.from(b64, "base64").toString("utf8").trim();
+  try {
+    return Buffer.from(b64, "base64").toString("utf8").trim();
+  } catch {
+    return null;
+  }
 }
 
 function recomputeReceiptHash(receipt) {
   const clone = structuredClone(receipt);
 
-  // remove proof
+  // Remove proof prior to hashing
   if (clone?.metadata?.proof) delete clone.metadata.proof;
 
-  // IMPORTANT: if metadata is now empty, delete it too
-  if (clone?.metadata && typeof clone.metadata === "object" && Object.keys(clone.metadata).length === 0) {
+  // IMPORTANT: if metadata becomes empty after removing proof, delete it too
+  if (
+    clone?.metadata &&
+    typeof clone.metadata === "object" &&
+    !Array.isArray(clone.metadata) &&
+    Object.keys(clone.metadata).length === 0
+  ) {
     delete clone.metadata;
   }
 
@@ -62,6 +71,7 @@ function recomputeReceiptHash(receipt) {
 function signEd25519(hashHex) {
   const pem = readPemB64Env("RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64");
   if (!pem) throw new Error("Missing RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64");
+
   const msg = Buffer.from(hashHex, "hex");
   const sig = crypto.sign(null, msg, { key: pem });
   return sig.toString("base64");
@@ -79,7 +89,8 @@ function attachReceiptProofOrThrow(receipt) {
     signature_b64: signEd25519(hash)
   };
 
-  if (!receipt.metadata.proof.signature_b64 || !receipt.metadata.proof.hash_sha256) {
+  // Hard fail if we ever accidentally emit an unsigned proof
+  if (!receipt?.metadata?.proof?.signature_b64 || !receipt?.metadata?.proof?.hash_sha256) {
     throw new Error("INTERNAL: receipt proof missing after signing");
   }
 
@@ -141,6 +152,7 @@ async function resolveSchemasFromENS() {
 async function resolveVerifierKeyFromENS() {
   const resolver = await getResolver();
 
+  // optional metadata — useful for humans/clients, not required for crypto verify
   const alg = (await resolver.getText("cl.receipt.alg"))?.trim() || null;
   const signer_id = (await resolver.getText("cl.receipt.signer_id"))?.trim() || null;
 
@@ -220,27 +232,16 @@ async function getEnsVerifierKey({ refresh = false } = {}) {
   if (!refresh && cacheValid()) return { ...ensKeyCache, source: "ens-cache" };
 
   const now = Date.now();
-  try {
-    const k = await resolveVerifierKeyFromENS();
-    ensKeyCache = {
-      ...k,
-      cached_at: new Date(now).toISOString(),
-      expires_at: new Date(now + ENS_CACHE_TTL_MS).toISOString(),
-      error: null
-    };
-    return { ...ensKeyCache, source: "ens" };
-  } catch (e) {
-    const err = String(e?.message ?? e);
-    ensKeyCache = {
-      alg: null,
-      signer_id: null,
-      pubkey_pem: null,
-      cached_at: new Date(now).toISOString(),
-      expires_at: new Date(now + Math.min(ENS_CACHE_TTL_MS, 60_000)).toISOString(),
-      error: err
-    };
-    throw new Error(err);
-  }
+  const k = await resolveVerifierKeyFromENS();
+
+  ensKeyCache = {
+    ...k,
+    cached_at: new Date(now).toISOString(),
+    expires_at: new Date(now + ENS_CACHE_TTL_MS).toISOString(),
+    error: null
+  };
+
+  return { ...ensKeyCache, source: "ens" };
 }
 
 /* -------------------- always-on routes -------------------- */
@@ -269,7 +270,7 @@ app.get("/debug/env", (_req, res) => {
     ens_name: ENS_NAME,
     has_rpc: Boolean(ETH_RPC_URL),
 
-    // PROVE we are on the right Railway service/environment
+    // quick sanity for “right env”
     ping_test: process.env.PING_TEST || null,
 
     signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || SERVICE_NAME,
@@ -320,15 +321,20 @@ app.post("/verify", async (req, res) => {
       return res.status(400).json({ ok: false, error: "missing metadata.proof.signature_b64 or hash_sha256" });
     }
 
+    // schema check
     const schema_valid = validateRcpt ? Boolean(validateRcpt(receipt)) : false;
     const schema_errors = validateRcpt
       ? (validateRcpt.errors || null)
       : [{ message: "receipt validator not ready", schemaState }];
 
+    // hash check
     const recomputed_hash = recomputeReceiptHash(receipt);
     const claimed_hash = String(proof.hash_sha256);
     const hash_matches = recomputed_hash === claimed_hash;
 
+    // key selection:
+    // - default uses env public key (good for internal checks)
+    // - ?ens=1 uses ENS-published key (public, decentralized verification)
     const requireEns = String(req.query?.ens || "") === "1";
     const refresh = String(req.query?.refresh || "") === "1";
 
@@ -351,6 +357,7 @@ app.post("/verify", async (req, res) => {
       });
     }
 
+    // signature check (ed25519 over hash bytes)
     let signature_valid = false;
     let signature_error = null;
     try {
@@ -441,6 +448,7 @@ app.post(REQUEST_PATH, async (req, res) => {
       }
     };
 
+    // no silent unsigned receipts
     attachReceiptProofOrThrow(receipt);
 
     if (!validateRcpt(receipt)) {
