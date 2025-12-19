@@ -12,17 +12,36 @@ app.use(express.json({ limit: "2mb" }));
 
 /* -------------------- config -------------------- */
 
+// Runtime identity (used in trace.provider + default signer_id)
 const SERVICE_NAME = process.env.SERVICE_NAME?.trim() || "commandlayer-runtime";
+
+// ENS used to resolve schema TXT records for each verb.
+// Template lets one runtime serve many verbs.
+// Example: "{verb}agent.eth" -> fetchagent.eth, cleanagent.eth, etc.
+const SCHEMA_ENS_TEMPLATE = process.env.SCHEMA_ENS_TEMPLATE?.trim() || "{verb}agent.eth";
+
+// ENS used to resolve verifier public key (cl.receipt.* TXT records).
+// This should be ONE stable ENS name for the whole Commons signer.
+// If unset, falls back to ENS_NAME.
+// Recommended: set this to something like "commandlayer.eth" or "runtime.commandlayer.eth".
 const ENS_NAME = process.env.ENS_NAME?.trim() || null;
+const VERIFIER_ENS_NAME = process.env.VERIFIER_ENS_NAME?.trim() || ENS_NAME;
+
 const ETH_RPC_URL = process.env.ETH_RPC_URL?.trim() || null;
 
+// Optional override: if set, ALL verbs use these schema URLs (not recommended for multi-verb)
 const ENV_REQ_URL = process.env.SCHEMA_REQUEST_URL?.trim() || null;
 const ENV_RCPT_URL = process.env.SCHEMA_RECEIPT_URL?.trim() || null;
 
-const REQUEST_PATH = "/fetch/v1.0.0";
 const PORT = Number(process.env.PORT || 8080);
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 8000);
 const ENS_CACHE_TTL_MS = Number(process.env.ENS_CACHE_TTL_MS || 10 * 60 * 1000); // 10m
+
+// Which verbs are enabled on this runtime
+const ENABLED_VERBS = (process.env.ENABLED_VERBS?.trim() || "fetch,describe,clean,format,summarize,parse,convert,extract,classify,analyze")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 /* -------------------- helpers -------------------- */
 
@@ -35,7 +54,7 @@ function sha256Hex(s) {
 }
 
 function canonicalJson(obj) {
-  // v1: stable-enough canonicalization (property order is insertion order)
+  // v1: stable-enough canonicalization (insertion order)
   return JSON.stringify(obj);
 }
 
@@ -55,7 +74,7 @@ function recomputeReceiptHash(receipt) {
   // Remove proof prior to hashing
   if (clone?.metadata?.proof) delete clone.metadata.proof;
 
-  // IMPORTANT: if metadata becomes empty after removing proof, delete it too
+  // If metadata becomes empty after removing proof, delete it too
   if (
     clone?.metadata &&
     typeof clone.metadata === "object" &&
@@ -71,7 +90,6 @@ function recomputeReceiptHash(receipt) {
 function signEd25519(hashHex) {
   const pem = readPemB64Env("RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64");
   if (!pem) throw new Error("Missing RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64");
-
   const msg = Buffer.from(hashHex, "hex");
   const sig = crypto.sign(null, msg, { key: pem });
   return sig.toString("base64");
@@ -89,7 +107,6 @@ function attachReceiptProofOrThrow(receipt) {
     signature_b64: signEd25519(hash)
   };
 
-  // Hard fail if we ever accidentally emit an unsigned proof
   if (!receipt?.metadata?.proof?.signature_b64 || !receipt?.metadata?.proof?.hash_sha256) {
     throw new Error("INTERNAL: receipt proof missing after signing");
   }
@@ -126,6 +143,10 @@ function blocked(url) {
   }
 }
 
+function ensForVerb(verb) {
+  return SCHEMA_ENS_TEMPLATE.replaceAll("{verb}", verb);
+}
+
 /* -------------------- ENS helpers -------------------- */
 
 async function getProvider() {
@@ -133,41 +154,45 @@ async function getProvider() {
   return new ethers.JsonRpcProvider(ETH_RPC_URL);
 }
 
-async function getResolver() {
-  if (!ENS_NAME) throw new Error("Missing ENS_NAME");
+async function getResolver(name) {
+  if (!name) throw new Error("Missing ENS name");
   const provider = await getProvider();
-  const resolver = await provider.getResolver(ENS_NAME);
-  if (!resolver) throw new Error(`No resolver for ${ENS_NAME}`);
+  const resolver = await provider.getResolver(name);
+  if (!resolver) throw new Error(`No resolver for ${name}`);
   return resolver;
 }
 
-async function resolveSchemasFromENS() {
-  const resolver = await getResolver();
+async function resolveSchemasFromENS(verb) {
+  const name = ensForVerb(verb);
+  const resolver = await getResolver(name);
   const reqUrl = await resolver.getText("cl.schema.request");
   const rcptUrl = await resolver.getText("cl.schema.receipt");
-  if (!reqUrl || !rcptUrl) throw new Error("ENS missing cl.schema.request or cl.schema.receipt");
-  return { reqUrl, rcptUrl };
+  if (!reqUrl || !rcptUrl) throw new Error(`ENS missing schema TXT records on ${name}`);
+  return { ens: name, reqUrl, rcptUrl };
 }
 
 async function resolveVerifierKeyFromENS() {
-  const resolver = await getResolver();
+  const resolver = await getResolver(VERIFIER_ENS_NAME);
 
-  // optional metadata — useful for humans/clients, not required for crypto verify
   const alg = (await resolver.getText("cl.receipt.alg"))?.trim() || null;
   const signer_id = (await resolver.getText("cl.receipt.signer_id"))?.trim() || null;
 
   const pubEscaped = await resolver.getText("cl.receipt.pubkey_pem");
-  if (!pubEscaped) throw new Error("ENS missing cl.receipt.pubkey_pem");
+  if (!pubEscaped) throw new Error(`ENS missing cl.receipt.pubkey_pem on ${VERIFIER_ENS_NAME}`);
 
   const pubkey_pem = pubEscaped.replace(/\\n/g, "\n").trim();
-  return { alg, signer_id, pubkey_pem };
+  return { ens: VERIFIER_ENS_NAME, alg, signer_id, pubkey_pem };
 }
 
-/* -------------------- schema loading (non-blocking) -------------------- */
+/* -------------------- schema cache per verb -------------------- */
 
-let schemaState = { mode: "booting", ok: false, reqUrl: null, rcptUrl: null, error: null };
-let validateReq = null;
-let validateRcpt = null;
+const verbSchemaCache = new Map(); // verb -> { mode, ok, ens, reqUrl, rcptUrl, vReq, vRcpt, error, cached_at, expires_at }
+
+function verbCacheValid(verb) {
+  const v = verbSchemaCache.get(verb);
+  if (!v?.expires_at) return false;
+  return Date.now() < Date.parse(v.expires_at);
+}
 
 async function buildValidators(reqUrl, rcptUrl) {
   const ajv = new Ajv2020({
@@ -186,50 +211,77 @@ async function buildValidators(reqUrl, rcptUrl) {
   return { vReq, vRcpt };
 }
 
-async function initSchemas() {
-  try {
-    schemaState = { mode: "booting", ok: false, reqUrl: null, rcptUrl: null, error: null };
+async function getVerbSchemas(verb, { refresh = false } = {}) {
+  if (!refresh && verbCacheValid(verb)) return verbSchemaCache.get(verb);
 
+  const now = Date.now();
+  const entry = {
+    mode: "booting",
+    ok: false,
+    ens: null,
+    reqUrl: null,
+    rcptUrl: null,
+    vReq: null,
+    vRcpt: null,
+    error: null,
+    cached_at: new Date(now).toISOString(),
+    expires_at: new Date(now + ENS_CACHE_TTL_MS).toISOString()
+  };
+
+  verbSchemaCache.set(verb, entry);
+
+  try {
+    // Optional global env override (not recommended when serving many verbs)
     let reqUrl = ENV_REQ_URL;
     let rcptUrl = ENV_RCPT_URL;
+    let ens = null;
 
     if (!reqUrl || !rcptUrl) {
-      const ens = await resolveSchemasFromENS();
-      reqUrl = ens.reqUrl;
-      rcptUrl = ens.rcptUrl;
+      const resolved = await resolveSchemasFromENS(verb);
+      ens = resolved.ens;
+      reqUrl = resolved.reqUrl;
+      rcptUrl = resolved.rcptUrl;
     }
 
     const { vReq, vRcpt } = await buildValidators(reqUrl, rcptUrl);
-    validateReq = vReq;
-    validateRcpt = vRcpt;
 
-    schemaState = { mode: "ready", ok: true, reqUrl, rcptUrl, error: null };
-    console.log("Schemas READY");
+    const ready = {
+      ...entry,
+      mode: "ready",
+      ok: true,
+      ens,
+      reqUrl,
+      rcptUrl,
+      vReq,
+      vRcpt,
+      error: null
+    };
+
+    verbSchemaCache.set(verb, ready);
+    return ready;
   } catch (e) {
-    validateReq = null;
-    validateRcpt = null;
-    schemaState = {
+    const degraded = {
+      ...entry,
       mode: "degraded",
       ok: false,
-      reqUrl: ENV_REQ_URL,
-      rcptUrl: ENV_RCPT_URL,
       error: String(e?.message ?? e)
     };
-    console.error("Schemas DEGRADED:", schemaState.error);
+    verbSchemaCache.set(verb, degraded);
+    return degraded;
   }
 }
 
 /* -------------------- ENS verifier key cache -------------------- */
 
-let ensKeyCache = null; // { alg, signer_id, pubkey_pem, cached_at, expires_at, error }
+let ensKeyCache = null; // { ens, alg, signer_id, pubkey_pem, cached_at, expires_at, error }
 
-function cacheValid() {
+function keyCacheValid() {
   if (!ensKeyCache?.pubkey_pem || !ensKeyCache?.expires_at) return false;
   return Date.now() < Date.parse(ensKeyCache.expires_at);
 }
 
 async function getEnsVerifierKey({ refresh = false } = {}) {
-  if (!refresh && cacheValid()) return { ...ensKeyCache, source: "ens-cache" };
+  if (!refresh && keyCacheValid()) return { ...ensKeyCache, source: "ens-cache" };
 
   const now = Date.now();
   const k = await resolveVerifierKeyFromENS();
@@ -267,10 +319,14 @@ app.get("/debug/env", (_req, res) => {
     cwd: process.cwd(),
     port: PORT,
     service: SERVICE_NAME,
-    ens_name: ENS_NAME,
-    has_rpc: Boolean(ETH_RPC_URL),
 
-    // quick sanity for “right env”
+    ens_name: ENS_NAME,
+    verifier_ens_name: VERIFIER_ENS_NAME,
+    schema_ens_template: SCHEMA_ENS_TEMPLATE,
+
+    has_rpc: Boolean(ETH_RPC_URL),
+    enabled_verbs: ENABLED_VERBS,
+
     ping_test: process.env.PING_TEST || null,
 
     signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || SERVICE_NAME,
@@ -280,8 +336,6 @@ app.get("/debug/env", (_req, res) => {
     has_priv_b64: Boolean(process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64),
     has_pub_b64: Boolean(process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64),
     pub_env_preview: pubEnv ? pubEnv.slice(0, 30) + "..." : null,
-
-    schema_state: schemaState,
 
     ens_verifier_cache: {
       has_key: Boolean(ensKeyCache?.pubkey_pem),
@@ -297,7 +351,7 @@ app.get("/debug/enskey", async (_req, res) => {
     const k = await getEnsVerifierKey({ refresh: true });
     res.json({
       ok: true,
-      ens: ENS_NAME,
+      ens: k.ens,
       alg: k.alg,
       signer_id: k.signer_id,
       pubkey_source: k.source,
@@ -308,6 +362,25 @@ app.get("/debug/enskey", async (_req, res) => {
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message ?? e) });
   }
+});
+
+app.get("/debug/verbs", async (req, res) => {
+  const refresh = String(req.query?.refresh || "") === "1";
+  const out = {};
+  for (const verb of ENABLED_VERBS) {
+    const s = await getVerbSchemas(verb, { refresh });
+    out[verb] = {
+      mode: s.mode,
+      ok: s.ok,
+      ens: s.ens,
+      reqUrl: s.reqUrl,
+      rcptUrl: s.rcptUrl,
+      error: s.error || null,
+      cached_at: s.cached_at,
+      expires_at: s.expires_at
+    };
+  }
+  res.json({ ok: true, verbs: out });
 });
 
 /* -------------------- /verify -------------------- */
@@ -321,20 +394,25 @@ app.post("/verify", async (req, res) => {
       return res.status(400).json({ ok: false, error: "missing metadata.proof.signature_b64 or hash_sha256" });
     }
 
-    // schema check
-    const schema_valid = validateRcpt ? Boolean(validateRcpt(receipt)) : false;
-    const schema_errors = validateRcpt
-      ? (validateRcpt.errors || null)
-      : [{ message: "receipt validator not ready", schemaState }];
+    // Best-effort schema validation:
+    // - If receipt.x402.verb exists, validate against that verb’s receipt schema
+    const verb = receipt?.x402?.verb?.trim?.() || null;
+    let schema_valid = false;
+    let schema_errors = null;
 
-    // hash check
+    if (verb && ENABLED_VERBS.includes(verb)) {
+      const s = await getVerbSchemas(verb);
+      if (s?.vRcpt) schema_valid = Boolean(s.vRcpt(receipt));
+      schema_errors = s?.vRcpt ? (s.vRcpt.errors || null) : [{ message: "receipt validator not ready", schemaState: s }];
+    } else {
+      schema_valid = false;
+      schema_errors = [{ message: "unknown verb for schema validation", verb }];
+    }
+
     const recomputed_hash = recomputeReceiptHash(receipt);
     const claimed_hash = String(proof.hash_sha256);
     const hash_matches = recomputed_hash === claimed_hash;
 
-    // key selection:
-    // - default uses env public key (good for internal checks)
-    // - ?ens=1 uses ENS-published key (public, decentralized verification)
     const requireEns = String(req.query?.ens || "") === "1";
     const refresh = String(req.query?.refresh || "") === "1";
 
@@ -357,7 +435,6 @@ app.post("/verify", async (req, res) => {
       });
     }
 
-    // signature check (ed25519 over hash bytes)
     let signature_valid = false;
     let signature_error = null;
     try {
@@ -371,6 +448,7 @@ app.post("/verify", async (req, res) => {
       ok: true,
       checks: { schema_valid, hash_matches, signature_valid },
       values: {
+        verb,
         signer_id: proof.signer_id || null,
         alg: proof.alg || null,
         canonical: proof.canonical || null,
@@ -385,46 +463,106 @@ app.post("/verify", async (req, res) => {
   }
 });
 
-/* -------------------- runtime route -------------------- */
+/* -------------------- verb handlers -------------------- */
 
-app.post(REQUEST_PATH, async (req, res) => {
-  if (!validateReq || !validateRcpt) {
-    return res.status(503).json({ error: "schemas not ready", schema: schemaState });
+// ✅ Real handler (already proven)
+async function handle_fetch(request) {
+  const url = request.source;
+  if (blocked(url)) {
+    return { ok: false, error: { code: "BAD_SOURCE", message: "blocked or invalid source", retryable: false } };
+  }
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+  let r, text;
+  try {
+    r = await fetch(url, { signal: controller.signal });
+    text = await r.text();
+  } finally {
+    clearTimeout(t);
+  }
+
+  const headers = {};
+  r.headers.forEach((v, k) => (headers[k] = v));
+
+  return {
+    ok: true,
+    result: {
+      items: [
+        {
+          source: url,
+          query: request.query ?? null,
+          include_metadata: request.include_metadata ?? null,
+          ok: r.ok,
+          http_status: r.status,
+          headers,
+          body_preview: (text || "").slice(0, 2000)
+        }
+      ]
+    }
+  };
+}
+
+// 🧱 Stubs for now (signed receipts, but you’ll make them schema-green as we implement each)
+// These do NOT attempt to fake a success shape. They return a signed error receipt.
+async function handler_stub(_request, verb) {
+  return {
+    ok: false,
+    error: {
+      code: "NOT_IMPLEMENTED",
+      message: `Verb '${verb}' is enabled but not implemented yet in this runtime.`,
+      retryable: false
+    }
+  };
+}
+
+const HANDLERS = {
+  fetch: (req) => handle_fetch(req),
+
+  describe: (req) => handler_stub(req, "describe"),
+  clean: (req) => handler_stub(req, "clean"),
+  format: (req) => handler_stub(req, "format"),
+  summarize: (req) => handler_stub(req, "summarize"),
+  parse: (req) => handler_stub(req, "parse"),
+  convert: (req) => handler_stub(req, "convert"),
+  extract: (req) => handler_stub(req, "extract"),
+  classify: (req) => handler_stub(req, "classify"),
+  analyze: (req) => handler_stub(req, "analyze")
+};
+
+/* -------------------- runtime route (multi-verb) -------------------- */
+
+app.post("/:verb/v1.0.0", async (req, res) => {
+  const verb = String(req.params.verb || "").trim();
+
+  if (!verb || !ENABLED_VERBS.includes(verb)) {
+    return res.status(404).json({ error: "unknown verb", verb });
   }
 
   const t0 = Date.now();
 
+  // Load validators for this verb
+  const schemas = await getVerbSchemas(verb);
+  if (!schemas.ok || !schemas.vReq || !schemas.vRcpt) {
+    return res.status(503).json({ error: "schemas not ready", verb, schema: schemas });
+  }
+
+  // Validate request
+  const request = req.body;
+  if (!schemas.vReq(request)) {
+    return res.status(400).json({ error: "request schema invalid", verb, details: schemas.vReq.errors });
+  }
+
+  // Execute via handler
+  const started_at = new Date().toISOString();
+  const trace_id = id("trace");
+  const handler = HANDLERS[verb];
+
   try {
-    const request = req.body;
+    const exec = handler ? await handler(request) : await handler_stub(request, verb);
 
-    if (!validateReq(request)) {
-      return res.status(400).json({ error: "request schema invalid", details: validateReq.errors });
-    }
-
-    const url = request.source;
-    if (blocked(url)) {
-      return res.status(400).json({ error: "blocked or invalid source" });
-    }
-
-    const started_at = new Date().toISOString();
-    const trace_id = id("trace");
-
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
-    let r, text;
-    try {
-      r = await fetch(url, { signal: controller.signal });
-      text = await r.text();
-    } finally {
-      clearTimeout(t);
-    }
-
-    const headers = {};
-    r.headers.forEach((v, k) => (headers[k] = v));
-
-    const receipt = {
-      status: "success",
+    const base = {
       x402: request.x402,
       trace: {
         trace_id,
@@ -432,27 +570,39 @@ app.post(REQUEST_PATH, async (req, res) => {
         completed_at: new Date().toISOString(),
         duration_ms: Date.now() - t0,
         provider: SERVICE_NAME
-      },
-      result: {
-        items: [
-          {
-            source: url,
-            query: request.query ?? null,
-            include_metadata: request.include_metadata ?? null,
-            ok: r.ok,
-            http_status: r.status,
-            headers,
-            body_preview: (text || "").slice(0, 2000)
-          }
-        ]
       }
     };
 
-    // no silent unsigned receipts
+    let receipt;
+
+    if (exec.ok) {
+      receipt = {
+        status: "success",
+        ...base,
+        result: exec.result
+      };
+    } else {
+      receipt = {
+        status: "error",
+        ...base,
+        error: exec.error || { code: "RUNTIME_ERROR", message: "unknown error", retryable: true }
+      };
+
+      // NOTE: Some verb receipt schemas may still require `result` even on error.
+      // We are not guessing shapes. When we implement each verb, we’ll shape errors to match its schema.
+    }
+
     attachReceiptProofOrThrow(receipt);
 
-    if (!validateRcpt(receipt)) {
-      return res.status(500).json({ error: "receipt schema invalid", details: validateRcpt.errors });
+    // Validate receipt against verb receipt schema
+    if (!schemas.vRcpt(receipt)) {
+      // This is expected for stubbed verbs until their schemas are implemented.
+      return res.status(500).json({
+        error: "receipt schema invalid",
+        verb,
+        details: schemas.vRcpt.errors,
+        note: "Handler output does not match this verb’s receipt schema yet. Implement the verb handler next."
+      });
     }
 
     return res.json(receipt);
@@ -460,11 +610,9 @@ app.post(REQUEST_PATH, async (req, res) => {
     const msg = String(e?.message ?? e);
     return res.status(500).json({
       error: "runtime_error",
+      verb,
       message: msg,
-      hint:
-        msg.includes("DECODER") || msg.includes("decoder") || msg.includes("PEM") || msg.includes("Missing RECEIPT_")
-          ? "Signing key misconfigured (check *_PEM_B64 vars and redeploy)."
-          : null
+      hint: msg.includes("Missing RECEIPT_") ? "Signing key misconfigured (check *_PEM_B64 vars)." : null
     });
   }
 });
@@ -474,6 +622,3 @@ app.post(REQUEST_PATH, async (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`listening on ${PORT}`);
 });
-
-// do not block server startup
-initSchemas();
