@@ -12,26 +12,30 @@ app.use(express.json({ limit: "2mb" }));
 
 /* -------------------- config -------------------- */
 
-// Runtime identity (trace.provider + default signer_id)
+// Runtime identity (used in trace.provider + default signer_id)
 const SERVICE_NAME = process.env.SERVICE_NAME?.trim() || "commandlayer-runtime";
 
 // ENS used to resolve schema TXT records for each verb.
-// Example: "{verb}agent.eth" -> fetchagent.eth, cleanagent.eth, formatagent.eth, ...
+// Example template: "{verb}agent.eth" -> fetchagent.eth, describeagent.eth, etc.
 const SCHEMA_ENS_TEMPLATE = process.env.SCHEMA_ENS_TEMPLATE?.trim() || "{verb}agent.eth";
 
 // ENS used to resolve verifier public key (cl.receipt.* TXT records).
-// Recommended: one stable ENS name (e.g., runtime.commandlayer.eth or cl-runtime.eth).
+// This should be ONE stable ENS name for the whole Commons signer.
 const ENS_NAME = process.env.ENS_NAME?.trim() || null;
 const VERIFIER_ENS_NAME = process.env.VERIFIER_ENS_NAME?.trim() || ENS_NAME;
 
 const ETH_RPC_URL = process.env.ETH_RPC_URL?.trim() || null;
+
+// Optional override: if set, ALL verbs use these schema URLs (not recommended for multi-verb)
+const ENV_REQ_URL = process.env.SCHEMA_REQUEST_URL?.trim() || null;
+const ENV_RCPT_URL = process.env.SCHEMA_RECEIPT_URL?.trim() || null;
 
 const PORT = Number(process.env.PORT || 8080);
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 8000);
 const ENS_CACHE_TTL_MS = Number(process.env.ENS_CACHE_TTL_MS || 10 * 60 * 1000); // 10m
 
 // Which verbs are enabled on this runtime
-const ENABLED_VERBS = (process.env.ENABLED_VERBS?.trim() || "fetch,format,describe")
+const ENABLED_VERBS = (process.env.ENABLED_VERBS?.trim() || "fetch,describe")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -47,7 +51,7 @@ function sha256Hex(s) {
 }
 
 function canonicalJson(obj) {
-  // v1 canonicalization: stable-enough (insertion order)
+  // v1: stable-enough canonicalization (insertion order)
   return JSON.stringify(obj);
 }
 
@@ -179,7 +183,8 @@ async function resolveVerifierKeyFromENS() {
 
 /* -------------------- schema cache per verb -------------------- */
 
-const verbSchemaCache = new Map(); // verb -> { mode, ok, ens, reqUrl, rcptUrl, vReq, vRcpt, error, cached_at, expires_at }
+const verbSchemaCache = new Map();
+// verb -> { mode, ok, ens, reqUrl, rcptUrl, vReq, vRcpt, error, cached_at, expires_at }
 
 function verbCacheValid(verb) {
   const v = verbSchemaCache.get(verb);
@@ -224,16 +229,26 @@ async function getVerbSchemas(verb, { refresh = false } = {}) {
   verbSchemaCache.set(verb, entry);
 
   try {
-    const resolved = await resolveSchemasFromENS(verb);
-    const { vReq, vRcpt } = await buildValidators(resolved.reqUrl, resolved.rcptUrl);
+    let reqUrl = ENV_REQ_URL;
+    let rcptUrl = ENV_RCPT_URL;
+    let ens = null;
+
+    if (!reqUrl || !rcptUrl) {
+      const resolved = await resolveSchemasFromENS(verb);
+      ens = resolved.ens;
+      reqUrl = resolved.reqUrl;
+      rcptUrl = resolved.rcptUrl;
+    }
+
+    const { vReq, vRcpt } = await buildValidators(reqUrl, rcptUrl);
 
     const ready = {
       ...entry,
       mode: "ready",
       ok: true,
-      ens: resolved.ens,
-      reqUrl: resolved.reqUrl,
-      rcptUrl: resolved.rcptUrl,
+      ens,
+      reqUrl,
+      rcptUrl,
       vReq,
       vRcpt,
       error: null
@@ -308,8 +323,6 @@ app.get("/debug/env", (_req, res) => {
 
     has_rpc: Boolean(ETH_RPC_URL),
     enabled_verbs: ENABLED_VERBS,
-
-    ping_test: process.env.PING_TEST || null,
 
     signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || SERVICE_NAME,
     signer_ok,
@@ -484,115 +497,55 @@ async function handle_fetch(request) {
   };
 }
 
-// ✅ format (schema-green for your format.receipt schema)
-function formatBulletList(text) {
-  const lines = String(text).split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-  if (lines.length === 0) return "-";
-  return lines.map((l) => `- ${l}`).join("\n");
-}
-
-function formatJsonBlock(text) {
-  const t = String(text).trim();
-  try {
-    const obj = JSON.parse(t);
-    return JSON.stringify(obj, null, 2);
-  } catch {
-    return JSON.stringify({ content: t }, null, 2);
-  }
-}
-
-function formatMarkdown(text) {
-  return String(text).replace(/\r\n/g, "\n").trim();
-}
-
-function formatTable(text) {
-  const rawLines = String(text).replace(/\r\n/g, "\n").split("\n").map((l) => l.trim()).filter(Boolean);
-  if (rawLines.length < 2) return formatBulletList(text);
-
-  const rows = rawLines.map((line) => line.split(/\t|,|\s*\|\s*/).map((s) => s.trim()).filter(Boolean));
-  const maxCols = Math.max(...rows.map((r) => r.length));
-  if (maxCols < 2) return formatBulletList(text);
-
-  const padded = rows.map((r) => {
-    const rr = r.slice(0, maxCols);
-    while (rr.length < maxCols) rr.push("");
-    return rr;
-  });
-
-  const header = padded[0];
-  const body = padded.slice(1);
-  const esc = (s) => String(s).replace(/\|/g, "\\|");
-
-  const headerLine = `| ${header.map(esc).join(" | ")} |`;
-  const sepLine = `| ${header.map(() => "---").join(" | ")} |`;
-  const bodyLines = body.map((r) => `| ${r.map(esc).join(" | ")} |`).join("\n");
-
-  return [headerLine, sepLine, bodyLines].filter(Boolean).join("\n");
-}
-
-async function handle_format(request) {
-  const original = String(request?.input?.content ?? "");
-  const target = String(request?.input?.target_style ?? "").trim();
-  let style = target || "markdown";
-  let formatted = original;
-  let notes = null;
-
-  const t = style.toLowerCase();
-
-  if (t === "markdown" || t === "md") {
-    formatted = formatMarkdown(original);
-    style = "markdown";
-  } else if (t === "bullet-list" || t === "bullets" || t === "list") {
-    formatted = formatBulletList(original);
-    style = "bullet-list";
-  } else if (t === "json" || t === "json-block") {
-    formatted = formatJsonBlock(original);
-    style = "json-block";
-  } else if (t === "table" || t === "markdown-table") {
-    formatted = formatTable(original);
-    style = "table";
-  } else {
-    formatted = formatMarkdown(original);
-    style = target || "markdown";
-    notes = `Unknown target_style '${target}'. Returned trimmed content.`;
-  }
-
-  if (!formatted || String(formatted).length === 0) {
-    formatted = " ";
-    notes = notes || "Formatting produced empty output; returning a single space.";
-  }
-
-  return {
-    ok: true,
-    result: {
-      formatted_content: formatted,
-      style,
-      original_length: original.length,
-      formatted_length: formatted.length,
-      ...(notes ? { notes } : {})
-    }
-  };
-}
-
-// ✅ describe (schema-green assuming describe.receipt has result.description string)
-// If your describe schemas name the field differently, tell me the exact key and I’ll adjust.
+// ✅ describe (schema-green for your schemas)
 async function handle_describe(request) {
-  const content = String(request?.input?.content ?? "");
-  const kind = String(request?.input?.kind ?? "text").trim(); // optional
-  const description = `${kind}: ${content.slice(0, 300).trim()}${content.length > 300 ? "…" : ""}`;
+  const input = request?.input || {};
+  const subject = String(input.subject ?? "").trim();
+  const context = typeof input.context === "string" ? input.context.trim() : "";
+  const detail_level = (input.detail_level || "short").toString();
+  const audience = typeof input.audience === "string" ? input.audience.trim() : "";
 
-  // Guarantee non-empty
-  const out = description.length ? description : "text: (empty)";
+  // Your request schema already requires subject, but keep runtime robust:
+  if (!subject) {
+    return {
+      ok: false,
+      error: { code: "BAD_REQUEST", message: "input.subject is required", retryable: false }
+    };
+  }
+
+  // Keep it deterministic / cheap / no external dependencies for now.
+  // This is a “reference runtime” describe, not an LLM.
+  const bullets = [];
+  bullets.push(`Subject: ${subject}`);
+  if (context) bullets.push(`Context provided (${context.length} chars)`);
+  bullets.push(`Detail level: ${detail_level}`);
+  if (audience) bullets.push(`Audience: ${audience}`);
+
+  const descriptionParts = [];
+  descriptionParts.push(`A request to describe "${subject}".`);
+  if (context) descriptionParts.push(`Context: ${context.slice(0, 240)}${context.length > 240 ? "…" : ""}`);
+  descriptionParts.push(
+    "This is a reference implementation: it emits a schema-valid, signed receipt proving the request/receipt contract, hashing, and verification pipeline."
+  );
+
+  const properties = {
+    subject,
+    detail_level,
+    ...(audience ? { audience } : {}),
+    ...(context ? { has_context: "true" } : { has_context: "false" })
+  };
 
   return {
     ok: true,
     result: {
-      description: out
+      description: descriptionParts.join(" "),
+      bullets,
+      properties
     }
   };
 }
 
-// Stub (keeps multi-verb structure ready)
+// Stub for future verbs (we do NOT lie with fake success shapes)
 async function handler_stub(_request, verb) {
   return {
     ok: false,
@@ -605,9 +558,8 @@ async function handler_stub(_request, verb) {
 }
 
 const HANDLERS = {
-  fetch: handle_fetch,
-  format: handle_format,
-  describe: handle_describe
+  fetch: (req) => handle_fetch(req),
+  describe: (req) => handle_describe(req)
 };
 
 /* -------------------- runtime route (multi-verb) -------------------- */
@@ -653,19 +605,10 @@ app.post("/:verb/v1.0.0", async (req, res) => {
     };
 
     let receipt;
-
     if (exec.ok) {
-      receipt = {
-        status: "success",
-        ...base,
-        result: exec.result
-      };
+      receipt = { status: "success", ...base, result: exec.result };
     } else {
-      receipt = {
-        status: "error",
-        ...base,
-        error: exec.error || { code: "RUNTIME_ERROR", message: "unknown error", retryable: true }
-      };
+      receipt = { status: "error", ...base, error: exec.error };
     }
 
     attachReceiptProofOrThrow(receipt);
@@ -676,7 +619,8 @@ app.post("/:verb/v1.0.0", async (req, res) => {
         error: "receipt schema invalid",
         verb,
         details: schemas.vRcpt.errors,
-        note: "Handler output does not match this verb’s receipt schema. Adjust handler output to match the schema."
+        note:
+          "This means the handler output does not match the verb receipt schema. Fix the handler (not the schemas) to make it green."
       });
     }
 
