@@ -12,21 +12,18 @@ app.use(express.json({ limit: "2mb" }));
 
 /* -------------------- config -------------------- */
 
-// Runtime identity (used in trace.provider + default signer_id)
 const SERVICE_NAME = process.env.SERVICE_NAME?.trim() || "commandlayer-runtime";
 
-// ENS used to resolve schema TXT records for each verb.
-// Example: "{verb}agent.eth" -> fetchagent.eth, describeagent.eth, cleanagent.eth, etc.
+// ENS template for schemas (per-verb)
 const SCHEMA_ENS_TEMPLATE = process.env.SCHEMA_ENS_TEMPLATE?.trim() || "{verb}agent.eth";
 
-// ENS used to resolve verifier public key (cl.receipt.* TXT records).
-// This should be ONE stable ENS name for the whole Commons signer.
+// ENS name for verifier public key
 const ENS_NAME = process.env.ENS_NAME?.trim() || null;
 const VERIFIER_ENS_NAME = process.env.VERIFIER_ENS_NAME?.trim() || ENS_NAME;
 
 const ETH_RPC_URL = process.env.ETH_RPC_URL?.trim() || null;
 
-// Optional override: if set, ALL verbs use these schema URLs (not recommended for multi-verb)
+// Optional global override (not recommended for multi-verb)
 const ENV_REQ_URL = process.env.SCHEMA_REQUEST_URL?.trim() || null;
 const ENV_RCPT_URL = process.env.SCHEMA_RECEIPT_URL?.trim() || null;
 
@@ -34,9 +31,8 @@ const PORT = Number(process.env.PORT || 8080);
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 8000);
 const ENS_CACHE_TTL_MS = Number(process.env.ENS_CACHE_TTL_MS || 10 * 60 * 1000); // 10m
 
-// Which verbs are enabled on this runtime
-const ENABLED_VERBS = (process.env.ENABLED_VERBS?.trim() ||
-  "fetch,describe,clean,format,summarize,parse,convert,extract,classify,analyze")
+// Enable verbs (start with these 3)
+const ENABLED_VERBS = (process.env.ENABLED_VERBS?.trim() || "fetch,describe,format")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -69,10 +65,8 @@ function readPemB64Env(name) {
 function recomputeReceiptHash(receipt) {
   const clone = structuredClone(receipt);
 
-  // Remove proof prior to hashing
   if (clone?.metadata?.proof) delete clone.metadata.proof;
 
-  // If metadata becomes empty after removing proof, delete it too
   if (
     clone?.metadata &&
     typeof clone.metadata === "object" &&
@@ -226,7 +220,6 @@ async function getVerbSchemas(verb, { refresh = false } = {}) {
     cached_at: new Date(now).toISOString(),
     expires_at: new Date(now + ENS_CACHE_TTL_MS).toISOString()
   };
-
   verbSchemaCache.set(verb, entry);
 
   try {
@@ -243,27 +236,11 @@ async function getVerbSchemas(verb, { refresh = false } = {}) {
 
     const { vReq, vRcpt } = await buildValidators(reqUrl, rcptUrl);
 
-    const ready = {
-      ...entry,
-      mode: "ready",
-      ok: true,
-      ens,
-      reqUrl,
-      rcptUrl,
-      vReq,
-      vRcpt,
-      error: null
-    };
-
+    const ready = { ...entry, mode: "ready", ok: true, ens, reqUrl, rcptUrl, vReq, vRcpt, error: null };
     verbSchemaCache.set(verb, ready);
     return ready;
   } catch (e) {
-    const degraded = {
-      ...entry,
-      mode: "degraded",
-      ok: false,
-      error: String(e?.message ?? e)
-    };
+    const degraded = { ...entry, mode: "degraded", ok: false, error: String(e?.message ?? e) };
     verbSchemaCache.set(verb, degraded);
     return degraded;
   }
@@ -324,8 +301,6 @@ app.get("/debug/env", (_req, res) => {
 
     has_rpc: Boolean(ETH_RPC_URL),
     enabled_verbs: ENABLED_VERBS,
-
-    ping_test: process.env.PING_TEST || null,
 
     signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || SERVICE_NAME,
     signer_ok,
@@ -461,11 +436,10 @@ app.post("/verify", async (req, res) => {
 
 /* -------------------- verb handlers -------------------- */
 
-// ✅ fetch (real IO verb)
 async function handle_fetch(request) {
   const url = request.source;
   if (blocked(url)) {
-    return { ok: false, httpStatus: 400, error: { code: "BAD_SOURCE", message: "blocked or invalid source", retryable: false } };
+    return { ok: false, error: { code: "BAD_SOURCE", message: "blocked or invalid source", retryable: false } };
   }
 
   const controller = new AbortController();
@@ -500,69 +474,145 @@ async function handle_fetch(request) {
   };
 }
 
-// ✅ describe (schema-green)
-function buildDescribe(subject, { context, detail_level, audience } = {}) {
-  const s = String(subject || "").trim();
-  const lvl = (detail_level || "short").toLowerCase();
-  const aud = audience ? String(audience).trim() : null;
-  const ctx = context ? String(context).trim() : null;
-
-  const base = `**${s}** is a CommandLayer concept: a canonical, verifiable semantic interface agents can call using published schemas and receipts.`;
-  const add1 = `It’s designed so different runtimes can execute the same intent without changing meaning, because the meaning is enforced by schemas.`;
-  const add2 = `Receipts are verifiable evidence of what executed (verb, version, inputs/outputs), not just logs.`;
-
-  let description = base;
-  if (lvl === "medium") description = `${base} ${add1}`;
-  if (lvl === "long") description = `${base} ${add1} ${add2}`;
-
-  // slight audience tailoring (still deterministic)
-  if (aud && /novice|beginner/i.test(aud)) {
-    description = description.replace("canonical, verifiable semantic interface", "standard “API meaning” contract");
-  }
-
-  const bullets = [];
-  bullets.push("Schemas define meaning (requests + receipts).");
-  bullets.push("Runtimes can be swapped without breaking interoperability.");
-  bullets.push("Receipts can be independently verified (hash + signature).");
-
-  if (ctx) bullets.push(`Context: ${ctx.slice(0, 220)}`);
-
-  const properties = {
-    verb: "describe",
-    version: "1.0.0",
-    audience: aud || "unspecified",
-    detail_level: lvl
-  };
-
-  return { description, bullets, properties };
+function clampLen(s, max) {
+  const x = String(s ?? "");
+  return x.length <= max ? x : x.slice(0, max);
 }
 
 async function handle_describe(request) {
-  const input = request?.input || {};
-  const subject = input?.subject;
+  const subject = request?.input?.subject ?? "";
+  const detail = request?.input?.detail_level ?? "short";
+  const audience = request?.input?.audience ?? "general";
+  const ctx = request?.input?.context ? ` Context: ${request.input.context}` : "";
 
-  const out = buildDescribe(subject, {
-    context: input?.context,
-    detail_level: input?.detail_level,
-    audience: input?.audience
-  });
+  // Simple deterministic-ish output for now (no model).
+  // Schema only requires "description" string; bullets/properties are optional.
+  let description =
+    `**${clampLen(subject, 120)}** is a CommandLayer concept: ` +
+    `a standard “API meaning” contract agents can call using published schemas and receipts.` +
+    ctx;
+
+  if (detail === "medium") {
+    description += " It makes meaning portable across runtimes, and makes outcomes verifiable after the fact.";
+  }
+  if (detail === "long") {
+    description +=
+      " It combines canonical verbs, strict JSON Schemas (requests + receipts), and cryptographic receipts (hash + signature) so interoperability survives vendor swaps.";
+  }
 
   return {
     ok: true,
     result: {
-      description: out.description,
-      bullets: out.bullets,
-      properties: out.properties
+      description,
+      bullets: [
+        "Schemas define meaning (requests + receipts).",
+        "Runtimes can be swapped without breaking interoperability.",
+        "Receipts can be independently verified (hash + signature)."
+      ],
+      properties: {
+        verb: "describe",
+        version: "1.0.0",
+        audience,
+        detail_level: detail
+      }
     }
   };
 }
 
-// Not implemented yet -> do NOT emit bad receipts
-const IMPLEMENTED = new Set(["fetch", "describe"]);
+async function handle_format(request) {
+  const content = String(request?.input?.content ?? "");
+  const target_style = String(request?.input?.target_style ?? "").trim();
+
+  if (!content) {
+    return { ok: false, error: { code: "EMPTY_CONTENT", message: "input.content is required", retryable: false } };
+  }
+  if (!target_style) {
+    return { ok: false, error: { code: "EMPTY_TARGET_STYLE", message: "input.target_style is required", retryable: false } };
+  }
+
+  const original_length = content.length;
+
+  // Minimal “format” transformations that are deterministic and safe.
+  // This is not a model. It’s a schema-green reference implementation.
+  let formatted = content;
+
+  const style = target_style.toLowerCase();
+
+  if (style === "bullet-list" || style === "bullets") {
+    // Split lines, trim, prefix
+    const lines = content
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .slice(0, 64);
+
+    formatted = lines.map((l) => `- ${l}`).join("\n");
+  } else if (style === "markdown") {
+    // Wrap in a markdown block if it looks like JSON, else leave as-is but trimmed
+    const trimmed = content.trim();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      formatted = "```json\n" + trimmed + "\n```";
+    } else {
+      formatted = trimmed;
+    }
+  } else if (style === "json-block" || style === "json") {
+    // Try to parse and pretty print JSON. If it fails, return as a JSON string wrapper.
+    try {
+      const obj = JSON.parse(content);
+      formatted = JSON.stringify(obj, null, 2);
+    } catch {
+      formatted = JSON.stringify({ content }, null, 2);
+    }
+  } else if (style === "table") {
+    // Extremely simple: turn lines with ":" into a 2-col markdown table
+    const rows = content
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .slice(0, 64)
+      .map((l) => {
+        const i = l.indexOf(":");
+        if (i === -1) return [l, ""];
+        return [l.slice(0, i).trim(), l.slice(i + 1).trim()];
+      });
+
+    formatted =
+      "| key | value |\n|---|---|\n" +
+      rows.map(([k, v]) => `| ${k.replaceAll("|", "\\|")} | ${v.replaceAll("|", "\\|")} |`).join("\n");
+  } else {
+    // Default: normalize whitespace a bit
+    formatted = content.replace(/\r\n/g, "\n").trim();
+  }
+
+  const formatted_length = formatted.length;
+
+  return {
+    ok: true,
+    result: {
+      formatted_content: formatted,
+      style: target_style,
+      original_length,
+      formatted_length,
+      notes: "Deterministic reference formatter (non-LLM)."
+    }
+  };
+}
+
+async function handler_stub(_request, verb) {
+  return {
+    ok: false,
+    error: {
+      code: "NOT_IMPLEMENTED",
+      message: `Verb '${verb}' is enabled but not implemented yet in this runtime.`,
+      retryable: false
+    }
+  };
+}
 
 const HANDLERS = {
   fetch: (req) => handle_fetch(req),
-  describe: (req) => handle_describe(req)
+  describe: (req) => handle_describe(req),
+  format: (req) => handle_format(req)
 };
 
 /* -------------------- runtime route (multi-verb) -------------------- */
@@ -574,19 +624,13 @@ app.post("/:verb/v1.0.0", async (req, res) => {
     return res.status(404).json({ error: "unknown verb", verb });
   }
 
-  if (!IMPLEMENTED.has(verb)) {
-    return res.status(501).json({ error: "not_implemented", verb, message: `Verb '${verb}' is enabled but not implemented in this runtime yet.` });
-  }
-
   const t0 = Date.now();
 
-  // Load validators for this verb
   const schemas = await getVerbSchemas(verb);
   if (!schemas.ok || !schemas.vReq || !schemas.vRcpt) {
     return res.status(503).json({ error: "schemas not ready", verb, schema: schemas });
   }
 
-  // Validate request
   const request = req.body;
   if (!schemas.vReq(request)) {
     return res.status(400).json({ error: "request schema invalid", verb, details: schemas.vReq.errors });
@@ -597,10 +641,9 @@ app.post("/:verb/v1.0.0", async (req, res) => {
   const handler = HANDLERS[verb];
 
   try {
-    const exec = await handler(request);
+    const exec = handler ? await handler(request) : await handler_stub(request, verb);
 
-    const receipt = {
-      status: "success",
+    const base = {
       x402: request.x402,
       trace: {
         trace_id,
@@ -608,18 +651,33 @@ app.post("/:verb/v1.0.0", async (req, res) => {
         completed_at: new Date().toISOString(),
         duration_ms: Date.now() - t0,
         provider: SERVICE_NAME
-      },
-      result: exec.result
+      }
     };
+
+    let receipt;
+
+    if (exec.ok) {
+      receipt = {
+        status: "success",
+        ...base,
+        result: exec.result
+      };
+    } else {
+      receipt = {
+        status: "error",
+        ...base,
+        error: exec.error || { code: "RUNTIME_ERROR", message: "unknown error", retryable: true }
+      };
+    }
 
     attachReceiptProofOrThrow(receipt);
 
-    // Validate receipt against verb receipt schema
     if (!schemas.vRcpt(receipt)) {
       return res.status(500).json({
         error: "receipt schema invalid",
         verb,
-        details: schemas.vRcpt.errors
+        details: schemas.vRcpt.errors,
+        note: "Handler output does not match this verb’s receipt schema yet."
       });
     }
 
