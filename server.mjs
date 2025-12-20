@@ -16,11 +16,13 @@ app.use(express.json({ limit: "2mb" }));
 const SERVICE_NAME = process.env.SERVICE_NAME?.trim() || "commandlayer-runtime";
 
 // ENS used to resolve schema TXT records for each verb.
+// Template lets one runtime serve many verbs.
 // Example: "{verb}agent.eth" -> fetchagent.eth, cleanagent.eth, etc.
 const SCHEMA_ENS_TEMPLATE = process.env.SCHEMA_ENS_TEMPLATE?.trim() || "{verb}agent.eth";
 
 // ENS used to resolve verifier public key (cl.receipt.* TXT records).
 // This should be ONE stable ENS name for the whole Commons signer.
+// If unset, falls back to ENS_NAME.
 const ENS_NAME = process.env.ENS_NAME?.trim() || null;
 const VERIFIER_ENS_NAME = process.env.VERIFIER_ENS_NAME?.trim() || ENS_NAME;
 
@@ -35,7 +37,8 @@ const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 8000);
 const ENS_CACHE_TTL_MS = Number(process.env.ENS_CACHE_TTL_MS || 10 * 60 * 1000); // 10m
 
 // Which verbs are enabled on this runtime
-const ENABLED_VERBS = (process.env.ENABLED_VERBS?.trim() || "fetch,describe,format,clean")
+const ENABLED_VERBS = (process.env.ENABLED_VERBS?.trim() ||
+  "fetch,describe,clean,format,parse,summarize,convert,extract,classify,analyze")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -101,7 +104,7 @@ function attachReceiptProofOrThrow(receipt) {
     canonical: "json-stringify",
     hash_sha256: hash,
     signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || SERVICE_NAME,
-    signature_b64: signEd25519(hash),
+    signature_b64: signEd25519(hash)
   };
 
   if (!receipt?.metadata?.proof?.signature_b64 || !receipt?.metadata?.proof?.hash_sha256) {
@@ -142,6 +145,13 @@ function blocked(url) {
 
 function ensForVerb(verb) {
   return SCHEMA_ENS_TEMPLATE.replaceAll("{verb}", verb);
+}
+
+function clamp01(n) {
+  if (Number.isNaN(n)) return 0;
+  if (n < 0) return 0;
+  if (n > 1) return 1;
+  return n;
 }
 
 /* -------------------- ENS helpers -------------------- */
@@ -195,7 +205,7 @@ async function buildValidators(reqUrl, rcptUrl) {
   const ajv = new Ajv2020({
     strict: true,
     allErrors: true,
-    loadSchema: async (uri) => (await fetch(uri)).json(),
+    loadSchema: async (uri) => (await fetch(uri)).json()
   });
   addFormats(ajv);
 
@@ -222,12 +232,13 @@ async function getVerbSchemas(verb, { refresh = false } = {}) {
     vRcpt: null,
     error: null,
     cached_at: new Date(now).toISOString(),
-    expires_at: new Date(now + ENS_CACHE_TTL_MS).toISOString(),
+    expires_at: new Date(now + ENS_CACHE_TTL_MS).toISOString()
   };
 
   verbSchemaCache.set(verb, entry);
 
   try {
+    // Optional global env override (not recommended when serving many verbs)
     let reqUrl = ENV_REQ_URL;
     let rcptUrl = ENV_RCPT_URL;
     let ens = null;
@@ -250,7 +261,7 @@ async function getVerbSchemas(verb, { refresh = false } = {}) {
       rcptUrl,
       vReq,
       vRcpt,
-      error: null,
+      error: null
     };
 
     verbSchemaCache.set(verb, ready);
@@ -260,7 +271,7 @@ async function getVerbSchemas(verb, { refresh = false } = {}) {
       ...entry,
       mode: "degraded",
       ok: false,
-      error: String(e?.message ?? e),
+      error: String(e?.message ?? e)
     };
     verbSchemaCache.set(verb, degraded);
     return degraded;
@@ -286,7 +297,7 @@ async function getEnsVerifierKey({ refresh = false } = {}) {
     ...k,
     cached_at: new Date(now).toISOString(),
     expires_at: new Date(now + ENS_CACHE_TTL_MS).toISOString(),
-    error: null,
+    error: null
   };
 
   return { ...ensKeyCache, source: "ens" };
@@ -337,8 +348,8 @@ app.get("/debug/env", (_req, res) => {
       has_key: Boolean(ensKeyCache?.pubkey_pem),
       cached_at: ensKeyCache?.cached_at || null,
       expires_at: ensKeyCache?.expires_at || null,
-      last_error: ensKeyCache?.error || null,
-    },
+      last_error: ensKeyCache?.error || null
+    }
   });
 });
 
@@ -353,7 +364,7 @@ app.get("/debug/enskey", async (_req, res) => {
       pubkey_source: k.source,
       pubkey_preview: k.pubkey_pem.slice(0, 40) + "...",
       cached_at: k.cached_at,
-      expires_at: k.expires_at,
+      expires_at: k.expires_at
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message ?? e) });
@@ -373,7 +384,7 @@ app.get("/debug/verbs", async (req, res) => {
       rcptUrl: s.rcptUrl,
       error: s.error || null,
       cached_at: s.cached_at,
-      expires_at: s.expires_at,
+      expires_at: s.expires_at
     };
   }
   res.json({ ok: true, verbs: out });
@@ -425,7 +436,7 @@ app.post("/verify", async (req, res) => {
     if (!pubPem) {
       return res.status(503).json({
         ok: false,
-        error: requireEns ? "ENS verifier key unavailable" : "Missing RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64",
+        error: requireEns ? "ENS verifier key unavailable" : "Missing RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64"
       });
     }
 
@@ -448,9 +459,9 @@ app.post("/verify", async (req, res) => {
         canonical: proof.canonical || null,
         claimed_hash,
         recomputed_hash,
-        pubkey_source,
+        pubkey_source
       },
-      errors: { schema_errors, signature_error },
+      errors: { schema_errors, signature_error }
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message ?? e) });
@@ -459,7 +470,7 @@ app.post("/verify", async (req, res) => {
 
 /* -------------------- verb handlers -------------------- */
 
-// ✅ fetch (real)
+// ✅ Real handler (already proven)
 async function handle_fetch(request) {
   const url = request.source;
   if (blocked(url)) {
@@ -491,239 +502,493 @@ async function handle_fetch(request) {
           ok: r.ok,
           http_status: r.status,
           headers,
-          body_preview: (text || "").slice(0, 2000),
-        },
-      ],
-    },
+          body_preview: (text || "").slice(0, 2000)
+        }
+      ]
+    }
   };
 }
 
-// ✅ describe (real)
+/* -------------------- describe (LLM-free reference impl) -------------------- */
+
 async function handle_describe(request) {
   const subject = String(request?.input?.subject ?? "").trim();
-  const detail = String(request?.input?.detail_level ?? "medium");
-  const audience = String(request?.input?.audience ?? "general");
-  const context = request?.input?.context ? String(request.input.context) : null;
+  const detail_level = String(request?.input?.detail_level ?? "").trim() || "short";
+  const audience = String(request?.input?.audience ?? "").trim() || "general";
 
-  const base = `**${subject}** is a CommandLayer subject: a standard “API meaning” contract agents can call using published schemas and receipts.`;
-  const more =
-    detail === "short"
-      ? base
-      : detail === "long"
-        ? `${base}\n\nIt’s designed so meaning (schemas) stays stable while execution (runtimes) can be swapped. Receipts make executions independently verifiable (schema + hash + signature).`
-        : base;
+  if (!subject) {
+    return { ok: false, error: { code: "EMPTY_SUBJECT", message: "input.subject is empty", retryable: false } };
+  }
 
   const bullets = [
     "Schemas define meaning (requests + receipts).",
     "Runtimes can be swapped without breaking interoperability.",
-    "Receipts can be independently verified (hash + signature).",
+    "Receipts can be independently verified (hash + signature)."
   ];
-
-  const properties = {
-    verb: "describe",
-    version: "1.0.0",
-    audience,
-    detail_level: detail,
-    ...(context ? { context: context.slice(0, 256) } : {}),
-  };
 
   return {
     ok: true,
     result: {
-      description: more,
+      description: `**${subject}** is a CommandLayer concept: a standard “API meaning” contract agents can call using published schemas and receipts.`,
       bullets,
-      properties,
-    },
+      properties: {
+        verb: "describe",
+        version: "1.0.0",
+        audience,
+        detail_level
+      }
+    }
   };
 }
 
-// ✅ format (real) — deterministic reference formatter (non-LLM)
-function toMarkdownTableFromPairs(pairs) {
-  const header = "| key | value |\n|---|---|";
-  const rows = pairs.map(([k, v]) => `| ${k} | ${v} |`).join("\n");
-  return `${header}\n${rows}`;
+/* -------------------- format (deterministic reference formatter) -------------------- */
+
+function tableFromKeyValueLines(s) {
+  const rows = [];
+  const lines = String(s || "").split(/\r?\n/);
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    let m = line.match(/^([^:]{1,200}):(.*)$/);
+    if (!m) m = line.match(/^([^=]{1,200})=(.*)$/);
+    if (!m) continue;
+    const k = m[1].trim();
+    const v = m[2].trim();
+    if (!k) continue;
+    rows.push([k, v]);
+  }
+  return rows;
 }
 
 async function handle_format(request) {
   const content = String(request?.input?.content ?? "");
-  const target = String(request?.input?.target_style ?? "").trim();
+  const target_style = String(request?.input?.target_style ?? "").trim();
+  const source_style = request?.input?.source_style ?? null;
 
-  const original_length = content.length;
-
-  // Minimal deterministic formatter:
-  // - if target_style === "table", try parsing "k: v" lines into a markdown table
-  // - else return content unchanged with notes
-  let formatted_content = content;
-  let style = target || "plain";
-  let notes = "Deterministic reference formatter (non-LLM).";
-
-  if (target === "table") {
-    const lines = content.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-    const pairs = [];
-    for (const line of lines) {
-      const m = line.match(/^([^:]+):\s*(.*)$/);
-      if (m) pairs.push([m[1].trim(), m[2].trim()]);
-    }
-    if (pairs.length > 0) {
-      formatted_content = toMarkdownTableFromPairs(pairs);
-      style = "table";
-    } else {
-      // fallback
-      formatted_content = content;
-      style = target;
-      notes = "No k:v pairs detected; returned content unchanged.";
-    }
+  if (!content) {
+    return { ok: false, error: { code: "EMPTY_CONTENT", message: "input.content is empty", retryable: false } };
+  }
+  if (!target_style) {
+    return { ok: false, error: { code: "EMPTY_TARGET_STYLE", message: "input.target_style is empty", retryable: false } };
   }
 
-  const formatted_length = formatted_content.length;
+  let formatted = content;
+
+  if (target_style === "table") {
+    const rows = tableFromKeyValueLines(content);
+    if (rows.length === 0) {
+      formatted = content; // nothing to do
+    } else {
+      const header = "| key | value |\n|---|---|\n";
+      const body = rows.map(([k, v]) => `| ${k} | ${v} |`).join("\n");
+      formatted = header + body;
+    }
+  } else if (target_style === "trim") {
+    formatted = content.trim();
+  } else if (target_style === "collapse_whitespace") {
+    formatted = content.replace(/[ \t]+/g, " ").replace(/\r?\n[ \t]*/g, "\n").trim();
+  } else {
+    // Unknown style: keep content unchanged but still schema-valid.
+    // This is a reference runtime, not a model.
+    formatted = content;
+  }
 
   return {
     ok: true,
     result: {
-      formatted_content,
-      style,
-      original_length,
-      formatted_length,
-      notes,
-    },
+      formatted_content: formatted,
+      style: target_style,
+      original_length: content.length,
+      formatted_length: formatted.length,
+      notes: `Deterministic reference formatter (non-LLM).${source_style ? ` source_style=${source_style}` : ""}`
+    }
   };
 }
 
-// ✅ clean (real) — deterministic operations matching your schema
-function applyCleanOperations(content, operations = []) {
-  let out = String(content ?? "");
-  const opsApplied = [];
-  const issues = [];
+/* -------------------- clean (deterministic sanitizer) -------------------- */
 
-  const addIssue = (s) => {
-    if (issues.length >= 128) return;
-    issues.push(String(s).slice(0, 256));
-  };
+function normalizeNewlines(s) {
+  return String(s || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
 
-  const seen = new Set();
-  const ops = Array.isArray(operations) ? operations : [];
-  for (const raw of ops) {
-    const op = String(raw || "").trim().toLowerCase();
-    if (!op) continue;
-    if (seen.has(op)) continue;
-    seen.add(op);
+function collapseWhitespace(s) {
+  // collapse spaces/tabs (not newlines)
+  return String(s || "").replace(/[ \t]+/g, " ");
+}
 
-    switch (op) {
-      case "trim": {
-        out = out.trim();
-        opsApplied.push("trim");
-        break;
-      }
-      case "normalize_newlines": {
-        out = out.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-        opsApplied.push("normalize_newlines");
-        break;
-      }
-      case "collapse_whitespace": {
-        // collapse runs of spaces/tabs, but keep newlines
-        out = out
-          .split("\n")
-          .map((line) => line.replace(/[ \t]+/g, " ").trimEnd())
-          .join("\n");
-        opsApplied.push("collapse_whitespace");
-        break;
-      }
-      case "remove_empty_lines": {
-        out = out
-          .split("\n")
-          .map((l) => l.trimEnd())
-          .filter((l) => l.trim().length > 0)
-          .join("\n");
-        opsApplied.push("remove_empty_lines");
-        break;
-      }
-      case "lowercase": {
-        out = out.toLowerCase();
-        opsApplied.push("lowercase");
-        break;
-      }
-      case "strip_non_ascii": {
-        const before = out;
-        out = out.replace(/[^\x09\x0A\x0D\x20-\x7E]/g, "");
-        if (before !== out) addIssue("non_ascii_stripped");
-        opsApplied.push("strip_non_ascii");
-        break;
-      }
-      case "redact_emails": {
-        const before = out;
-        out = out.replace(
-          /([a-zA-Z0-9._%+-]+)@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g,
-          "[redacted-email]"
-        );
-        if (before !== out) addIssue("emails_redacted");
-        opsApplied.push("redact_emails");
-        break;
-      }
-      case "redact_phones": {
-        const before = out;
-        // very rough phone pattern; goal is demo safety, not forensic accuracy
-        out = out.replace(
-          /(\+?\d{1,3}[\s.-]?)?(\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}/g,
-          "[redacted-phone]"
-        );
-        if (before !== out) addIssue("phones_redacted");
-        opsApplied.push("redact_phones");
-        break;
-      }
-      default: {
-        // Unknown ops: do not fail; just report
-        addIssue(`unknown_operation:${op}`.slice(0, 256));
-        break;
-      }
-    }
-  }
+function trimAll(s) {
+  return String(s || "").trim();
+}
 
-  // If no operations provided, still do sane defaults? NO.
-  // Your schema allows operations optional; caller chooses.
-  return { cleaned: out, opsApplied, issues };
+function removeEmptyLines(s) {
+  return String(s || "")
+    .split("\n")
+    .map((l) => l.replace(/[ \t]+$/g, ""))
+    .filter((l) => l.trim().length > 0)
+    .join("\n");
+}
+
+function redactEmails(s) {
+  const re = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
+  const had = re.test(s);
+  const out = String(s || "").replace(re, "[redacted-email]");
+  return { out, had };
 }
 
 async function handle_clean(request) {
   const content = String(request?.input?.content ?? "");
-  const operations = request?.input?.operations ?? [];
-  const original_length = content.length;
+  const operations = Array.isArray(request?.input?.operations) ? request.input.operations : [];
 
-  const { cleaned, opsApplied, issues } = applyCleanOperations(content, operations);
+  if (!content) {
+    return { ok: false, error: { code: "EMPTY_CONTENT", message: "input.content is empty", retryable: false } };
+  }
 
-  // Guarantee minLength: 1 in cleaned_content schema
-  const cleaned_content = cleaned.length > 0 ? cleaned : " ";
+  const ops = operations.map((s) => String(s || "").trim()).filter(Boolean);
+  const opsApplied = [];
+  const issues = [];
 
-  const cleaned_length = cleaned_content.length;
+  let out = content;
+  const original_length = out.length;
 
-  const result = {
-    cleaned_content,
-    original_length,
-    cleaned_length,
+  for (const op of ops) {
+    if (op === "normalize_newlines") {
+      out = normalizeNewlines(out);
+      opsApplied.push(op);
+      continue;
+    }
+    if (op === "collapse_whitespace") {
+      out = collapseWhitespace(out);
+      opsApplied.push(op);
+      continue;
+    }
+    if (op === "trim") {
+      out = trimAll(out);
+      opsApplied.push(op);
+      continue;
+    }
+    if (op === "remove_empty_lines") {
+      out = removeEmptyLines(out);
+      opsApplied.push(op);
+      continue;
+    }
+    if (op === "redact_emails") {
+      const r = redactEmails(out);
+      out = r.out;
+      opsApplied.push(op);
+      if (r.had) issues.push("emails_redacted");
+      continue;
+    }
+    // Unknown op: ignore (do not fail, keep schema-valid)
+  }
+
+  // Default behavior if no ops: normalize newlines + trim (safe minimal)
+  if (opsApplied.length === 0) {
+    out = trimAll(normalizeNewlines(out));
+    opsApplied.push("normalize_newlines");
+    opsApplied.push("trim");
+  }
+
+  return {
+    ok: true,
+    result: {
+      cleaned_content: out,
+      operations_applied: opsApplied.length ? opsApplied : undefined,
+      issues_detected: issues.length ? issues : undefined,
+      original_length,
+      cleaned_length: out.length
+    }
   };
-
-  if (opsApplied.length > 0) result.operations_applied = opsApplied.slice(0, 32);
-  if (issues.length > 0) result.issues_detected = issues.slice(0, 128);
-
-  return { ok: true, result };
 }
 
-// 🧱 For verbs you enabled but haven’t built yet
+/* -------------------- parse (deterministic) -------------------- */
+
+function tryJsonParse(s) {
+  try {
+    const v = JSON.parse(s);
+    return { ok: true, value: v };
+  } catch (e) {
+    return { ok: false, error: String(e?.message ?? e) };
+  }
+}
+
+function parseKeyValueLines(s) {
+  const out = {};
+  const warnings = [];
+  const lines = String(s || "").split(/\r?\n/);
+
+  let matched = 0;
+  let totalNonEmpty = 0;
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith("#")) continue;
+    totalNonEmpty++;
+
+    // key=value
+    let m = line.match(/^([^=]{1,200})=(.*)$/);
+    if (m) {
+      matched++;
+      const k = m[1].trim();
+      const v = m[2].trim();
+      if (k) out[k] = v;
+      continue;
+    }
+
+    // key: value
+    m = line.match(/^([^:]{1,200}):(.*)$/);
+    if (m) {
+      matched++;
+      const k = m[1].trim();
+      const v = m[2].trim();
+      if (k) out[k] = v;
+      continue;
+    }
+  }
+
+  if (matched === 0 && totalNonEmpty > 0) warnings.push("no_kv_pairs_detected");
+
+  return { parsed: out, warnings, matched, totalNonEmpty };
+}
+
+function parseYamlLike(s) {
+  const { parsed, warnings, matched, totalNonEmpty } = parseKeyValueLines(s);
+  if (matched === 0 && totalNonEmpty > 0) warnings.push("yaml_subset_only_top_level_kv");
+  return { parsed, warnings };
+}
+
+function parseCsv(s) {
+  const warnings = [];
+  const text = String(s || "").trim();
+  if (!text) return { parsed: { rows: [] }, warnings: ["empty_content"] };
+
+  const lines = text.split(/\r?\n/).filter(Boolean);
+  if (lines.length === 0) return { parsed: { rows: [] }, warnings: ["empty_content"] };
+
+  function splitCsvLine(line) {
+    const cells = [];
+    let cur = "";
+    let inQuotes = false;
+
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuotes && line[i + 1] === '"') {
+          cur += '"';
+          i++;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (ch === "," && !inQuotes) {
+        cells.push(cur.trim());
+        cur = "";
+      } else {
+        cur += ch;
+      }
+    }
+    cells.push(cur.trim());
+    return cells;
+  }
+
+  const headers = splitCsvLine(lines[0]).map((h) => h.replace(/^"|"$/g, "").trim());
+  if (headers.length === 0 || headers.every((h) => !h)) {
+    return { parsed: { rows: [] }, warnings: ["csv_missing_headers"] };
+  }
+
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const values = splitCsvLine(lines[i]).map((v) => v.replace(/^"|"$/g, "").trim());
+    const row = {};
+    for (let j = 0; j < headers.length; j++) {
+      const key = headers[j] || `col_${j + 1}`;
+      row[key] = values[j] ?? "";
+    }
+    rows.push(row);
+  }
+
+  return { parsed: { headers, rows }, warnings };
+}
+
+function parseLogLines(s) {
+  const warnings = [];
+  const lines = String(s || "").split(/\r?\n/).filter((l) => l.trim().length > 0);
+
+  const parsedLines = [];
+  let anyKv = false;
+
+  for (const line of lines) {
+    const kv = {};
+    const re = /([A-Za-z_][A-Za-z0-9_.-]{0,100})=("[^"]*"|'[^']*'|[^\s]+)/g;
+    let m;
+    while ((m = re.exec(line)) !== null) {
+      anyKv = true;
+      const k = m[1];
+      let v = m[2];
+      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+        v = v.slice(1, -1);
+      }
+      kv[k] = v;
+    }
+    parsedLines.push({ line, kv });
+  }
+
+  if (!anyKv && lines.length > 0) warnings.push("no_key_value_pairs_detected_in_logs");
+
+  return { parsed: { lines: parsedLines }, warnings };
+}
+
+async function handle_parse(request) {
+  const content = String(request?.input?.content ?? "");
+  const content_type = (request?.input?.content_type ?? "").toString().trim().toLowerCase();
+  const mode = (request?.input?.mode ?? "best_effort").toString();
+  const target_schema = request?.input?.target_schema ?? null;
+
+  if (!content) {
+    return { ok: false, error: { code: "EMPTY_CONTENT", message: "input.content is empty", retryable: false } };
+  }
+
+  const warnings = [];
+  let parsedObj = {};
+  let confidence = 0.5;
+
+  // json strict
+  if (content_type === "json") {
+    const j = tryJsonParse(content);
+    if (!j.ok) {
+      if (mode === "strict") {
+        return { ok: false, error: { code: "PARSE_JSON_FAILED", message: j.error, retryable: false } };
+      }
+      warnings.push("json_parse_failed_best_effort");
+    } else {
+      if (j.value && typeof j.value === "object" && !Array.isArray(j.value)) {
+        parsedObj = j.value;
+      } else {
+        parsedObj = { value: j.value };
+        warnings.push("json_wrapped_non_object");
+      }
+      confidence = 0.98;
+      return {
+        ok: true,
+        result: {
+          parsed: parsedObj,
+          target_schema: target_schema || undefined,
+          confidence,
+          warnings: warnings.length ? warnings : undefined
+        }
+      };
+    }
+  }
+
+  // yaml/yml kv-only subset
+  if (content_type === "yaml" || content_type === "yml") {
+    const y = parseYamlLike(content);
+    parsedObj = y.parsed;
+    warnings.push(...(y.warnings || []));
+    confidence = Object.keys(parsedObj).length ? 0.75 : 0.4;
+    return {
+      ok: true,
+      result: {
+        parsed: parsedObj,
+        target_schema: target_schema || undefined,
+        confidence: clamp01(confidence),
+        warnings: warnings.length ? warnings : undefined
+      }
+    };
+  }
+
+  // csv
+  if (content_type === "csv") {
+    const c = parseCsv(content);
+    parsedObj = c.parsed;
+    warnings.push(...(c.warnings || []));
+    confidence = (parsedObj?.rows?.length || 0) > 0 ? 0.85 : 0.5;
+    return {
+      ok: true,
+      result: {
+        parsed: parsedObj,
+        target_schema: target_schema || undefined,
+        confidence: clamp01(confidence),
+        warnings: warnings.length ? warnings : undefined
+      }
+    };
+  }
+
+  // log
+  if (content_type === "log") {
+    const l = parseLogLines(content);
+    parsedObj = l.parsed;
+    warnings.push(...(l.warnings || []));
+    confidence = warnings.includes("no_key_value_pairs_detected_in_logs") ? 0.45 : 0.8;
+    return {
+      ok: true,
+      result: {
+        parsed: parsedObj,
+        target_schema: target_schema || undefined,
+        confidence: clamp01(confidence),
+        warnings: warnings.length ? warnings : undefined
+      }
+    };
+  }
+
+  // heuristics best-effort
+  const j2 = tryJsonParse(content);
+  if (j2.ok) {
+    if (j2.value && typeof j2.value === "object" && !Array.isArray(j2.value)) parsedObj = j2.value;
+    else {
+      parsedObj = { value: j2.value };
+      warnings.push("json_wrapped_non_object");
+    }
+    confidence = 0.9;
+  } else {
+    const kv = parseKeyValueLines(content);
+    if (Object.keys(kv.parsed).length) {
+      parsedObj = kv.parsed;
+      warnings.push(...(kv.warnings || []));
+      confidence = 0.7;
+    } else {
+      const l = parseLogLines(content);
+      parsedObj = l.parsed;
+      warnings.push(...(l.warnings || []));
+      warnings.push("best_effort_fallback_log_lines");
+      confidence = 0.55;
+    }
+  }
+
+  return {
+    ok: true,
+    result: {
+      parsed: parsedObj,
+      target_schema: target_schema || undefined,
+      confidence: clamp01(confidence),
+      warnings: warnings.length ? warnings : undefined
+    }
+  };
+}
+
+// 🧱 Stubs for future verbs (signed receipts, but schema-green only once implemented)
 async function handler_stub(_request, verb) {
   return {
     ok: false,
     error: {
       code: "NOT_IMPLEMENTED",
       message: `Verb '${verb}' is enabled but not implemented yet in this runtime.`,
-      retryable: false,
-    },
+      retryable: false
+    }
   };
 }
 
 const HANDLERS = {
   fetch: (req) => handle_fetch(req),
   describe: (req) => handle_describe(req),
-  format: (req) => handle_format(req),
   clean: (req) => handle_clean(req),
+  format: (req) => handle_format(req),
+  parse: (req) => handle_parse(req),
+
+  summarize: (req) => handler_stub(req, "summarize"),
+  convert: (req) => handler_stub(req, "convert"),
+  extract: (req) => handler_stub(req, "extract"),
+  classify: (req) => handler_stub(req, "classify"),
+  analyze: (req) => handler_stub(req, "analyze")
 };
 
 /* -------------------- runtime route (multi-verb) -------------------- */
@@ -749,7 +1014,6 @@ app.post("/:verb/v1.0.0", async (req, res) => {
     return res.status(400).json({ error: "request schema invalid", verb, details: schemas.vReq.errors });
   }
 
-  // Execute via handler
   const started_at = new Date().toISOString();
   const trace_id = id("trace");
   const handler = HANDLERS[verb];
@@ -764,8 +1028,8 @@ app.post("/:verb/v1.0.0", async (req, res) => {
         started_at,
         completed_at: new Date().toISOString(),
         duration_ms: Date.now() - t0,
-        provider: SERVICE_NAME,
-      },
+        provider: SERVICE_NAME
+      }
     };
 
     let receipt;
@@ -774,13 +1038,13 @@ app.post("/:verb/v1.0.0", async (req, res) => {
       receipt = {
         status: "success",
         ...base,
-        result: exec.result,
+        result: exec.result
       };
     } else {
       receipt = {
         status: "error",
         ...base,
-        error: exec.error || { code: "RUNTIME_ERROR", message: "unknown error", retryable: true },
+        error: exec.error || { code: "RUNTIME_ERROR", message: "unknown error", retryable: true }
       };
     }
 
@@ -792,7 +1056,7 @@ app.post("/:verb/v1.0.0", async (req, res) => {
         error: "receipt schema invalid",
         verb,
         details: schemas.vRcpt.errors,
-        note: "Handler output does not match this verb’s receipt schema. Fix handler to match the schema.",
+        note: "Handler output does not match this verb’s receipt schema yet. Implement the verb handler next."
       });
     }
 
@@ -803,7 +1067,7 @@ app.post("/:verb/v1.0.0", async (req, res) => {
       error: "runtime_error",
       verb,
       message: msg,
-      hint: msg.includes("Missing RECEIPT_") ? "Signing key misconfigured (check *_PEM_B64 vars)." : null,
+      hint: msg.includes("Missing RECEIPT_") ? "Signing key misconfigured (check *_PEM_B64 vars)." : null
     });
   }
 });
