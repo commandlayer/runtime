@@ -16,7 +16,7 @@ app.use(express.json({ limit: "2mb" }));
 const SERVICE_NAME = process.env.SERVICE_NAME?.trim() || "commandlayer-runtime";
 
 // ENS used to resolve schema TXT records for each verb.
-// Example: "{verb}agent.eth" -> fetchagent.eth, describeagent.eth, etc.
+// Example: "{verb}agent.eth" -> fetchagent.eth, describeagent.eth, cleanagent.eth, etc.
 const SCHEMA_ENS_TEMPLATE = process.env.SCHEMA_ENS_TEMPLATE?.trim() || "{verb}agent.eth";
 
 // ENS used to resolve verifier public key (cl.receipt.* TXT records).
@@ -35,10 +35,8 @@ const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 8000);
 const ENS_CACHE_TTL_MS = Number(process.env.ENS_CACHE_TTL_MS || 10 * 60 * 1000); // 10m
 
 // Which verbs are enabled on this runtime
-const ENABLED_VERBS = (
-  process.env.ENABLED_VERBS?.trim() ||
-  "fetch,describe,clean,format,summarize,parse,convert,extract,classify,analyze"
-)
+const ENABLED_VERBS = (process.env.ENABLED_VERBS?.trim() ||
+  "fetch,describe,clean,format,summarize,parse,convert,extract,classify,analyze")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -104,7 +102,7 @@ function attachReceiptProofOrThrow(receipt) {
     canonical: "json-stringify",
     hash_sha256: hash,
     signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || SERVICE_NAME,
-    signature_b64: signEd25519(hash),
+    signature_b64: signEd25519(hash)
   };
 
   if (!receipt?.metadata?.proof?.signature_b64 || !receipt?.metadata?.proof?.hash_sha256) {
@@ -172,7 +170,6 @@ async function resolveSchemasFromENS(verb) {
 }
 
 async function resolveVerifierKeyFromENS() {
-  if (!VERIFIER_ENS_NAME) throw new Error("Missing VERIFIER_ENS_NAME (or ENS_NAME)");
   const resolver = await getResolver(VERIFIER_ENS_NAME);
 
   const alg = (await resolver.getText("cl.receipt.alg"))?.trim() || null;
@@ -187,7 +184,8 @@ async function resolveVerifierKeyFromENS() {
 
 /* -------------------- schema cache per verb -------------------- */
 
-const verbSchemaCache = new Map(); // verb -> { mode, ok, ens, reqUrl, rcptUrl, vReq, vRcpt, error, cached_at, expires_at }
+const verbSchemaCache = new Map();
+// verb -> { mode, ok, ens, reqUrl, rcptUrl, vReq, vRcpt, error, cached_at, expires_at }
 
 function verbCacheValid(verb) {
   const v = verbSchemaCache.get(verb);
@@ -199,7 +197,7 @@ async function buildValidators(reqUrl, rcptUrl) {
   const ajv = new Ajv2020({
     strict: true,
     allErrors: true,
-    loadSchema: async (uri) => (await fetch(uri)).json(),
+    loadSchema: async (uri) => (await fetch(uri)).json()
   });
   addFormats(ajv);
 
@@ -226,7 +224,7 @@ async function getVerbSchemas(verb, { refresh = false } = {}) {
     vRcpt: null,
     error: null,
     cached_at: new Date(now).toISOString(),
-    expires_at: new Date(now + ENS_CACHE_TTL_MS).toISOString(),
+    expires_at: new Date(now + ENS_CACHE_TTL_MS).toISOString()
   };
 
   verbSchemaCache.set(verb, entry);
@@ -254,7 +252,7 @@ async function getVerbSchemas(verb, { refresh = false } = {}) {
       rcptUrl,
       vReq,
       vRcpt,
-      error: null,
+      error: null
     };
 
     verbSchemaCache.set(verb, ready);
@@ -264,7 +262,7 @@ async function getVerbSchemas(verb, { refresh = false } = {}) {
       ...entry,
       mode: "degraded",
       ok: false,
-      error: String(e?.message ?? e),
+      error: String(e?.message ?? e)
     };
     verbSchemaCache.set(verb, degraded);
     return degraded;
@@ -290,7 +288,7 @@ async function getEnsVerifierKey({ refresh = false } = {}) {
     ...k,
     cached_at: new Date(now).toISOString(),
     expires_at: new Date(now + ENS_CACHE_TTL_MS).toISOString(),
-    error: null,
+    error: null
   };
 
   return { ...ensKeyCache, source: "ens" };
@@ -341,8 +339,8 @@ app.get("/debug/env", (_req, res) => {
       has_key: Boolean(ensKeyCache?.pubkey_pem),
       cached_at: ensKeyCache?.cached_at || null,
       expires_at: ensKeyCache?.expires_at || null,
-      last_error: ensKeyCache?.error || null,
-    },
+      last_error: ensKeyCache?.error || null
+    }
   });
 });
 
@@ -357,7 +355,7 @@ app.get("/debug/enskey", async (_req, res) => {
       pubkey_source: k.source,
       pubkey_preview: k.pubkey_pem.slice(0, 40) + "...",
       cached_at: k.cached_at,
-      expires_at: k.expires_at,
+      expires_at: k.expires_at
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message ?? e) });
@@ -377,7 +375,7 @@ app.get("/debug/verbs", async (req, res) => {
       rcptUrl: s.rcptUrl,
       error: s.error || null,
       cached_at: s.cached_at,
-      expires_at: s.expires_at,
+      expires_at: s.expires_at
     };
   }
   res.json({ ok: true, verbs: out });
@@ -394,7 +392,6 @@ app.post("/verify", async (req, res) => {
       return res.status(400).json({ ok: false, error: "missing metadata.proof.signature_b64 or hash_sha256" });
     }
 
-    // Best-effort schema validation by receipt.x402.verb
     const verb = receipt?.x402?.verb?.trim?.() || null;
     let schema_valid = false;
     let schema_errors = null;
@@ -430,7 +427,7 @@ app.post("/verify", async (req, res) => {
     if (!pubPem) {
       return res.status(503).json({
         ok: false,
-        error: requireEns ? "ENS verifier key unavailable" : "Missing RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64",
+        error: requireEns ? "ENS verifier key unavailable" : "Missing RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64"
       });
     }
 
@@ -453,9 +450,9 @@ app.post("/verify", async (req, res) => {
         canonical: proof.canonical || null,
         claimed_hash,
         recomputed_hash,
-        pubkey_source,
+        pubkey_source
       },
-      errors: { schema_errors, signature_error },
+      errors: { schema_errors, signature_error }
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message ?? e) });
@@ -464,11 +461,11 @@ app.post("/verify", async (req, res) => {
 
 /* -------------------- verb handlers -------------------- */
 
-// ✅ fetch (proven)
+// ✅ fetch (real IO verb)
 async function handle_fetch(request) {
   const url = request.source;
   if (blocked(url)) {
-    return { ok: false, error: { code: "BAD_SOURCE", message: "blocked or invalid source", retryable: false } };
+    return { ok: false, httpStatus: 400, error: { code: "BAD_SOURCE", message: "blocked or invalid source", retryable: false } };
   }
 
   const controller = new AbortController();
@@ -496,88 +493,76 @@ async function handle_fetch(request) {
           ok: r.ok,
           http_status: r.status,
           headers,
-          body_preview: (text || "").slice(0, 2000),
-        },
-      ],
-    },
+          body_preview: (text || "").slice(0, 2000)
+        }
+      ]
+    }
   };
 }
 
-// ✅ describe (schema-green, no external deps)
-async function handle_describe(request) {
-  const subject = String(request?.input?.subject ?? "").trim();
-  const context = request?.input?.context ? String(request.input.context).trim() : "";
-  const detail_level = request?.input?.detail_level ? String(request.input.detail_level).trim() : "medium";
-  const audience = request?.input?.audience ? String(request.input.audience).trim() : "general";
+// ✅ describe (schema-green)
+function buildDescribe(subject, { context, detail_level, audience } = {}) {
+  const s = String(subject || "").trim();
+  const lvl = (detail_level || "short").toLowerCase();
+  const aud = audience ? String(audience).trim() : null;
+  const ctx = context ? String(context).trim() : null;
 
-  // Keep it deterministic-ish and safe: templated description, no model calls.
-  // This is a "reference runtime" — not trying to be smart, trying to be schema-true.
-  let description = "";
-  if (detail_level === "short") {
-    description = `${subject} is a subject provided to the CommandLayer describe verb. This runtime returns a schema-valid description payload without relying on proprietary model outputs.`;
-  } else if (detail_level === "long") {
-    description =
-      `${subject} is the subject of a CommandLayer describe request.\n\n` +
-      `This reference runtime produces a deterministic, schema-valid description object. ` +
-      `It is intended to demonstrate: (1) request/receipt validation, (2) receipt hashing, and (3) Ed25519 signing + verification.\n\n` +
-      `Audience: ${audience}.` +
-      (context ? ` Context: ${context}` : "");
-  } else {
-    description =
-      `${subject} is the subject of a CommandLayer describe request. ` +
-      `This runtime responds with a schema-valid description and optional structured fields to prove end-to-end interoperability.` +
-      (context ? ` Context: ${context}` : "");
+  const base = `**${s}** is a CommandLayer concept: a canonical, verifiable semantic interface agents can call using published schemas and receipts.`;
+  const add1 = `It’s designed so different runtimes can execute the same intent without changing meaning, because the meaning is enforced by schemas.`;
+  const add2 = `Receipts are verifiable evidence of what executed (verb, version, inputs/outputs), not just logs.`;
+
+  let description = base;
+  if (lvl === "medium") description = `${base} ${add1}`;
+  if (lvl === "long") description = `${base} ${add1} ${add2}`;
+
+  // slight audience tailoring (still deterministic)
+  if (aud && /novice|beginner/i.test(aud)) {
+    description = description.replace("canonical, verifiable semantic interface", "standard “API meaning” contract");
   }
 
   const bullets = [];
-  if (detail_level !== "short") {
-    bullets.push("Schema-valid request/receipt");
-    bullets.push("Deterministic receipt hashing (proof excluded)");
-    bullets.push("Ed25519 signature over SHA-256 hash");
-    bullets.push("Public verification via ENS-published key");
-  }
+  bullets.push("Schemas define meaning (requests + receipts).");
+  bullets.push("Runtimes can be swapped without breaking interoperability.");
+  bullets.push("Receipts can be independently verified (hash + signature).");
+
+  if (ctx) bullets.push(`Context: ${ctx.slice(0, 220)}`);
 
   const properties = {
-    subject,
-    audience,
-    detail_level,
-    provider: SERVICE_NAME,
+    verb: "describe",
+    version: "1.0.0",
+    audience: aud || "unspecified",
+    detail_level: lvl
   };
+
+  return { description, bullets, properties };
+}
+
+async function handle_describe(request) {
+  const input = request?.input || {};
+  const subject = input?.subject;
+
+  const out = buildDescribe(subject, {
+    context: input?.context,
+    detail_level: input?.detail_level,
+    audience: input?.audience
+  });
 
   return {
     ok: true,
     result: {
-      description,
-      ...(bullets.length ? { bullets } : {}),
-      properties,
-    },
+      description: out.description,
+      bullets: out.bullets,
+      properties: out.properties
+    }
   };
 }
 
-// 🧱 Stubs for now (signed receipts, but will fail receipt-schema until implemented)
-async function handler_stub(_request, verb) {
-  return {
-    ok: false,
-    error: {
-      code: "NOT_IMPLEMENTED",
-      message: `Verb '${verb}' is enabled but not implemented yet in this runtime.`,
-      retryable: false,
-    },
-  };
-}
+// Not implemented yet -> do NOT emit bad receipts
+const IMPLEMENTED = new Set(["fetch", "describe"]);
 
 const HANDLERS = {
   fetch: (req) => handle_fetch(req),
-  describe: (req) => handle_describe(req),
-
-  clean: (req) => handler_stub(req, "clean"),
-  format: (req) => handler_stub(req, "format"),
-  summarize: (req) => handler_stub(req, "summarize"),
-  parse: (req) => handler_stub(req, "parse"),
-  convert: (req) => handler_stub(req, "convert"),
-  extract: (req) => handler_stub(req, "extract"),
-  classify: (req) => handler_stub(req, "classify"),
-  analyze: (req) => handler_stub(req, "analyze"),
+  describe: (req) => handle_describe(req)
 };
 
 /* -------------------- runtime route (multi-verb) -------------------- */
@@ -587,6 +572,10 @@ app.post("/:verb/v1.0.0", async (req, res) => {
 
   if (!verb || !ENABLED_VERBS.includes(verb)) {
     return res.status(404).json({ error: "unknown verb", verb });
+  }
+
+  if (!IMPLEMENTED.has(verb)) {
+    return res.status(501).json({ error: "not_implemented", verb, message: `Verb '${verb}' is enabled but not implemented in this runtime yet.` });
   }
 
   const t0 = Date.now();
@@ -603,40 +592,25 @@ app.post("/:verb/v1.0.0", async (req, res) => {
     return res.status(400).json({ error: "request schema invalid", verb, details: schemas.vReq.errors });
   }
 
-  // Execute via handler
   const started_at = new Date().toISOString();
   const trace_id = id("trace");
   const handler = HANDLERS[verb];
 
   try {
-    const exec = handler ? await handler(request) : await handler_stub(request, verb);
+    const exec = await handler(request);
 
-    const base = {
+    const receipt = {
+      status: "success",
       x402: request.x402,
       trace: {
         trace_id,
         started_at,
         completed_at: new Date().toISOString(),
         duration_ms: Date.now() - t0,
-        provider: SERVICE_NAME,
+        provider: SERVICE_NAME
       },
+      result: exec.result
     };
-
-    let receipt;
-
-    if (exec.ok) {
-      receipt = {
-        status: "success",
-        ...base,
-        result: exec.result,
-      };
-    } else {
-      receipt = {
-        status: "error",
-        ...base,
-        error: exec.error || { code: "RUNTIME_ERROR", message: "unknown error", retryable: true },
-      };
-    }
 
     attachReceiptProofOrThrow(receipt);
 
@@ -645,8 +619,7 @@ app.post("/:verb/v1.0.0", async (req, res) => {
       return res.status(500).json({
         error: "receipt schema invalid",
         verb,
-        details: schemas.vRcpt.errors,
-        note: "Handler output does not match this verb’s receipt schema yet (or verb is still stubbed).",
+        details: schemas.vRcpt.errors
       });
     }
 
@@ -657,7 +630,7 @@ app.post("/:verb/v1.0.0", async (req, res) => {
       error: "runtime_error",
       verb,
       message: msg,
-      hint: msg.includes("Missing RECEIPT_") ? "Signing key misconfigured (check *_PEM_B64 vars)." : null,
+      hint: msg.includes("Missing RECEIPT_") ? "Signing key misconfigured (check *_PEM_B64 vars)." : null
     });
   }
 });
