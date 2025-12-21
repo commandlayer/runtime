@@ -1,3 +1,4 @@
+// server.mjs
 console.log("SERVER.MJS BOOTED");
 
 import express from "express";
@@ -38,7 +39,7 @@ const ENS_CACHE_TTL_MS = Number(process.env.ENS_CACHE_TTL_MS || 10 * 60 * 1000);
 
 // Which verbs are enabled on this runtime
 const ENABLED_VERBS = (process.env.ENABLED_VERBS?.trim() ||
-  "fetch,describe,clean,format,parse,summarize,convert,extract,classify,analyze")
+  "fetch,describe,format,clean,parse,summarize")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -50,7 +51,7 @@ function id(prefix) {
 }
 
 function sha256Hex(s) {
-  return crypto.createHash("sha256").update(s).digest("hex");
+  return crypto.createHash("sha256").update(String(s)).digest("hex");
 }
 
 function canonicalJson(obj) {
@@ -145,13 +146,6 @@ function blocked(url) {
 
 function ensForVerb(verb) {
   return SCHEMA_ENS_TEMPLATE.replaceAll("{verb}", verb);
-}
-
-function clamp01(n) {
-  if (Number.isNaN(n)) return 0;
-  if (n < 0) return 0;
-  if (n > 1) return 1;
-  return n;
 }
 
 /* -------------------- ENS helpers -------------------- */
@@ -401,6 +395,8 @@ app.post("/verify", async (req, res) => {
       return res.status(400).json({ ok: false, error: "missing metadata.proof.signature_b64 or hash_sha256" });
     }
 
+    // Best-effort schema validation:
+    // - If receipt.x402.verb exists, validate against that verb’s receipt schema
     const verb = receipt?.x402?.verb?.trim?.() || null;
     let schema_valid = false;
     let schema_errors = null;
@@ -468,9 +464,9 @@ app.post("/verify", async (req, res) => {
   }
 });
 
-/* -------------------- verb handlers -------------------- */
+/* -------------------- verb implementations -------------------- */
 
-// ✅ Real handler (already proven)
+// ✅ fetch (real network)
 async function handle_fetch(request) {
   const url = request.source;
   if (blocked(url)) {
@@ -509,16 +505,14 @@ async function handle_fetch(request) {
   };
 }
 
-/* -------------------- describe (LLM-free reference impl) -------------------- */
+// ✅ describe (deterministic reference “explainer”)
+function describeTemplate(subject, detailLevel, audience) {
+  const s = String(subject || "").trim();
+  const dl = (detailLevel || "short").toLowerCase();
+  const aud = (audience || "novice").toLowerCase();
 
-async function handle_describe(request) {
-  const subject = String(request?.input?.subject ?? "").trim();
-  const detail_level = String(request?.input?.detail_level ?? "").trim() || "short";
-  const audience = String(request?.input?.audience ?? "").trim() || "general";
-
-  if (!subject) {
-    return { ok: false, error: { code: "EMPTY_SUBJECT", message: "input.subject is empty", retryable: false } };
-  }
+  const base =
+    `**${s}** is a CommandLayer concept: a standard “API meaning” contract agents can call using published schemas and receipts.`;
 
   const bullets = [
     "Schemas define meaning (requests + receipts).",
@@ -526,446 +520,343 @@ async function handle_describe(request) {
     "Receipts can be independently verified (hash + signature)."
   ];
 
+  if (dl === "long" || aud === "expert") {
+    bullets.push("ENS TXT records can point to canonical schema URIs + immutable mirrors (IPFS).");
+    bullets.push("Receipt proofs bind the semantic envelope to an execution outcome.");
+  }
+
+  return { base, bullets };
+}
+
+async function handle_describe(request) {
+  const subject = request?.input?.subject ?? "";
+  const detail_level = request?.input?.detail_level ?? "short";
+  const audience = request?.input?.audience ?? "novice";
+
+  const { base, bullets } = describeTemplate(subject, detail_level, audience);
+
   return {
     ok: true,
     result: {
-      description: `**${subject}** is a CommandLayer concept: a standard “API meaning” contract agents can call using published schemas and receipts.`,
+      description: base,
       bullets,
       properties: {
         verb: "describe",
         version: "1.0.0",
-        audience,
-        detail_level
+        audience: String(audience),
+        detail_level: String(detail_level)
       }
     }
   };
 }
 
-/* -------------------- format (deterministic reference formatter) -------------------- */
-
-function tableFromKeyValueLines(s) {
-  const rows = [];
-  const lines = String(s || "").split(/\r?\n/);
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (!line) continue;
-    let m = line.match(/^([^:]{1,200}):(.*)$/);
-    if (!m) m = line.match(/^([^=]{1,200})=(.*)$/);
+// ✅ format (deterministic reference formatter)
+function parseKeyValueLines(s) {
+  // Accept:
+  // a: 1
+  // b: 2
+  // c: 3
+  const out = [];
+  const lines = String(s || "").replace(/\r\n/g, "\n").split("\n");
+  for (const line of lines) {
+    const m = line.match(/^\s*([^:]+?)\s*:\s*(.*?)\s*$/);
     if (!m) continue;
-    const k = m[1].trim();
-    const v = m[2].trim();
-    if (!k) continue;
-    rows.push([k, v]);
+    out.push([m[1].trim(), m[2].trim()]);
   }
-  return rows;
+  return out;
+}
+
+function toMarkdownTable(pairs) {
+  const rows = pairs.map(([k, v]) => `| ${k} | ${v} |`);
+  return ["| key | value |", "|---|---|", ...rows].join("\n");
 }
 
 async function handle_format(request) {
-  const content = String(request?.input?.content ?? "");
-  const target_style = String(request?.input?.target_style ?? "").trim();
-  const source_style = request?.input?.source_style ?? null;
+  const content = request?.input?.content ?? "";
+  const target = String(request?.input?.target_style ?? "").toLowerCase().trim();
 
-  if (!content) {
-    return { ok: false, error: { code: "EMPTY_CONTENT", message: "input.content is empty", retryable: false } };
-  }
-  if (!target_style) {
-    return { ok: false, error: { code: "EMPTY_TARGET_STYLE", message: "input.target_style is empty", retryable: false } };
-  }
+  let formatted = "";
+  let style = target || "text";
 
-  let formatted = content;
-
-  if (target_style === "table") {
-    const rows = tableFromKeyValueLines(content);
-    if (rows.length === 0) {
-      formatted = content; // nothing to do
+  if (target === "table") {
+    const pairs = parseKeyValueLines(content);
+    if (pairs.length) {
+      formatted = toMarkdownTable(pairs);
+      style = "table";
     } else {
-      const header = "| key | value |\n|---|---|\n";
-      const body = rows.map(([k, v]) => `| ${k} | ${v} |`).join("\n");
-      formatted = header + body;
+      formatted = String(content).trim();
+      style = "text";
     }
-  } else if (target_style === "trim") {
-    formatted = content.trim();
-  } else if (target_style === "collapse_whitespace") {
-    formatted = content.replace(/[ \t]+/g, " ").replace(/\r?\n[ \t]*/g, "\n").trim();
+  } else if (target === "json-block" || target === "json") {
+    // best-effort: try parse JSON then re-stringify
+    try {
+      const obj = JSON.parse(String(content));
+      formatted = JSON.stringify(obj, null, 2);
+      style = "json";
+    } catch {
+      formatted = String(content).trim();
+      style = "text";
+    }
+  } else if (target === "markdown" || target === "bullet-list") {
+    // if it looks like CSV-ish / lines, bullet it
+    const lines = String(content).replace(/\r\n/g, "\n").split("\n").map((l) => l.trim()).filter(Boolean);
+    if (target === "bullet-list") {
+      formatted = lines.map((l) => `- ${l.replace(/^\s*[-•]\s*/, "")}`).join("\n");
+      style = "bullet-list";
+    } else {
+      formatted = lines.join("\n");
+      style = "markdown";
+    }
   } else {
-    // Unknown style: keep content unchanged but still schema-valid.
-    // This is a reference runtime, not a model.
-    formatted = content;
+    formatted = String(content).trim();
+    style = target || "text";
   }
 
   return {
     ok: true,
     result: {
-      formatted_content: formatted,
-      style: target_style,
-      original_length: content.length,
-      formatted_length: formatted.length,
-      notes: `Deterministic reference formatter (non-LLM).${source_style ? ` source_style=${source_style}` : ""}`
+      formatted_content: formatted || "(empty)",
+      style,
+      original_length: String(content || "").length,
+      formatted_length: String(formatted || "").length,
+      notes: "Deterministic reference formatter (non-LLM)."
     }
   };
 }
 
-/* -------------------- clean (deterministic sanitizer) -------------------- */
+// ✅ clean (deterministic sanitization pipeline)
+function applyCleanOps(input, ops = []) {
+  let s = String(input || "");
+  const applied = [];
+  const issues = [];
 
-function normalizeNewlines(s) {
-  return String(s || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-}
+  const list = Array.isArray(ops) ? ops.map(String) : [];
 
-function collapseWhitespace(s) {
-  // collapse spaces/tabs (not newlines)
-  return String(s || "").replace(/[ \t]+/g, " ");
-}
+  for (const op of list) {
+    if (op === "normalize_newlines") {
+      s = s.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      applied.push(op);
+    } else if (op === "collapse_whitespace") {
+      // collapse spaces/tabs, but keep newlines
+      s = s.replace(/[ \t]+/g, " ");
+      applied.push(op);
+    } else if (op === "trim") {
+      s = s.trim();
+      applied.push(op);
+    } else if (op === "remove_empty_lines") {
+      s = s
+        .split("\n")
+        .map((l) => l.trimEnd())
+        .filter((l) => l.trim().length > 0)
+        .join("\n");
+      applied.push(op);
+    } else if (op === "redact_emails") {
+      const before = s;
+      s = s.replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted-email]");
+      applied.push(op);
+      if (s !== before) issues.push("emails_redacted");
+    } else if (op) {
+      // Unknown op: ignore (do not break determinism)
+    }
+  }
 
-function trimAll(s) {
-  return String(s || "").trim();
-}
-
-function removeEmptyLines(s) {
-  return String(s || "")
-    .split("\n")
-    .map((l) => l.replace(/[ \t]+$/g, ""))
-    .filter((l) => l.trim().length > 0)
-    .join("\n");
-}
-
-function redactEmails(s) {
-  const re = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
-  const had = re.test(s);
-  const out = String(s || "").replace(re, "[redacted-email]");
-  return { out, had };
+  return { cleaned: s, applied, issues };
 }
 
 async function handle_clean(request) {
-  const content = String(request?.input?.content ?? "");
-  const operations = Array.isArray(request?.input?.operations) ? request.input.operations : [];
+  const content = request?.input?.content ?? "";
+  const ops = request?.input?.operations ?? [];
 
-  if (!content) {
-    return { ok: false, error: { code: "EMPTY_CONTENT", message: "input.content is empty", retryable: false } };
-  }
-
-  const ops = operations.map((s) => String(s || "").trim()).filter(Boolean);
-  const opsApplied = [];
-  const issues = [];
-
-  let out = content;
-  const original_length = out.length;
-
-  for (const op of ops) {
-    if (op === "normalize_newlines") {
-      out = normalizeNewlines(out);
-      opsApplied.push(op);
-      continue;
-    }
-    if (op === "collapse_whitespace") {
-      out = collapseWhitespace(out);
-      opsApplied.push(op);
-      continue;
-    }
-    if (op === "trim") {
-      out = trimAll(out);
-      opsApplied.push(op);
-      continue;
-    }
-    if (op === "remove_empty_lines") {
-      out = removeEmptyLines(out);
-      opsApplied.push(op);
-      continue;
-    }
-    if (op === "redact_emails") {
-      const r = redactEmails(out);
-      out = r.out;
-      opsApplied.push(op);
-      if (r.had) issues.push("emails_redacted");
-      continue;
-    }
-    // Unknown op: ignore (do not fail, keep schema-valid)
-  }
-
-  // Default behavior if no ops: normalize newlines + trim (safe minimal)
-  if (opsApplied.length === 0) {
-    out = trimAll(normalizeNewlines(out));
-    opsApplied.push("normalize_newlines");
-    opsApplied.push("trim");
-  }
+  const original_length = String(content).length;
+  const { cleaned, applied, issues } = applyCleanOps(content, ops);
 
   return {
     ok: true,
     result: {
-      cleaned_content: out,
-      operations_applied: opsApplied.length ? opsApplied : undefined,
+      cleaned_content: cleaned || "(empty)",
+      operations_applied: applied.length ? applied : undefined,
       issues_detected: issues.length ? issues : undefined,
       original_length,
-      cleaned_length: out.length
+      cleaned_length: String(cleaned).length
     }
   };
 }
 
-/* -------------------- parse (deterministic) -------------------- */
-
-function tryJsonParse(s) {
-  try {
-    const v = JSON.parse(s);
-    return { ok: true, value: v };
-  } catch (e) {
-    return { ok: false, error: String(e?.message ?? e) };
-  }
+// ✅ parse (deterministic parsers: json, yaml-ish key: value)
+function parseJsonStrict(s) {
+  return JSON.parse(String(s));
 }
 
-function parseKeyValueLines(s) {
+function parseYamlBestEffort(s) {
+  // very small subset: key: value per line
   const out = {};
-  const warnings = [];
-  const lines = String(s || "").split(/\r?\n/);
-
-  let matched = 0;
-  let totalNonEmpty = 0;
-
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (!line) continue;
-    if (line.startsWith("#")) continue;
-    totalNonEmpty++;
-
-    // key=value
-    let m = line.match(/^([^=]{1,200})=(.*)$/);
-    if (m) {
-      matched++;
-      const k = m[1].trim();
-      const v = m[2].trim();
-      if (k) out[k] = v;
-      continue;
-    }
-
-    // key: value
-    m = line.match(/^([^:]{1,200}):(.*)$/);
-    if (m) {
-      matched++;
-      const k = m[1].trim();
-      const v = m[2].trim();
-      if (k) out[k] = v;
-      continue;
-    }
-  }
-
-  if (matched === 0 && totalNonEmpty > 0) warnings.push("no_kv_pairs_detected");
-
-  return { parsed: out, warnings, matched, totalNonEmpty };
-}
-
-function parseYamlLike(s) {
-  const { parsed, warnings, matched, totalNonEmpty } = parseKeyValueLines(s);
-  if (matched === 0 && totalNonEmpty > 0) warnings.push("yaml_subset_only_top_level_kv");
-  return { parsed, warnings };
-}
-
-function parseCsv(s) {
-  const warnings = [];
-  const text = String(s || "").trim();
-  if (!text) return { parsed: { rows: [] }, warnings: ["empty_content"] };
-
-  const lines = text.split(/\r?\n/).filter(Boolean);
-  if (lines.length === 0) return { parsed: { rows: [] }, warnings: ["empty_content"] };
-
-  function splitCsvLine(line) {
-    const cells = [];
-    let cur = "";
-    let inQuotes = false;
-
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-      if (ch === '"') {
-        if (inQuotes && line[i + 1] === '"') {
-          cur += '"';
-          i++;
-        } else {
-          inQuotes = !inQuotes;
-        }
-      } else if (ch === "," && !inQuotes) {
-        cells.push(cur.trim());
-        cur = "";
-      } else {
-        cur += ch;
-      }
-    }
-    cells.push(cur.trim());
-    return cells;
-  }
-
-  const headers = splitCsvLine(lines[0]).map((h) => h.replace(/^"|"$/g, "").trim());
-  if (headers.length === 0 || headers.every((h) => !h)) {
-    return { parsed: { rows: [] }, warnings: ["csv_missing_headers"] };
-  }
-
-  const rows = [];
-  for (let i = 1; i < lines.length; i++) {
-    const values = splitCsvLine(lines[i]).map((v) => v.replace(/^"|"$/g, "").trim());
-    const row = {};
-    for (let j = 0; j < headers.length; j++) {
-      const key = headers[j] || `col_${j + 1}`;
-      row[key] = values[j] ?? "";
-    }
-    rows.push(row);
-  }
-
-  return { parsed: { headers, rows }, warnings };
-}
-
-function parseLogLines(s) {
-  const warnings = [];
-  const lines = String(s || "").split(/\r?\n/).filter((l) => l.trim().length > 0);
-
-  const parsedLines = [];
-  let anyKv = false;
-
+  const lines = String(s || "").replace(/\r\n/g, "\n").split("\n");
   for (const line of lines) {
-    const kv = {};
-    const re = /([A-Za-z_][A-Za-z0-9_.-]{0,100})=("[^"]*"|'[^']*'|[^\s]+)/g;
-    let m;
-    while ((m = re.exec(line)) !== null) {
-      anyKv = true;
-      const k = m[1];
-      let v = m[2];
-      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
-        v = v.slice(1, -1);
-      }
-      kv[k] = v;
-    }
-    parsedLines.push({ line, kv });
+    const m = line.match(/^\s*([^:#]+?)\s*:\s*(.*?)\s*$/);
+    if (!m) continue;
+    const k = m[1].trim();
+    const v = m[2].trim();
+    out[k] = v;
   }
-
-  if (!anyKv && lines.length > 0) warnings.push("no_key_value_pairs_detected_in_logs");
-
-  return { parsed: { lines: parsedLines }, warnings };
+  return out;
 }
 
 async function handle_parse(request) {
-  const content = String(request?.input?.content ?? "");
-  const content_type = (request?.input?.content_type ?? "").toString().trim().toLowerCase();
-  const mode = (request?.input?.mode ?? "best_effort").toString();
-  const target_schema = request?.input?.target_schema ?? null;
+  const content = request?.input?.content ?? "";
+  const content_type = String(request?.input?.content_type ?? "").toLowerCase().trim();
+  const mode = String(request?.input?.mode ?? "best_effort").toLowerCase().trim();
 
-  if (!content) {
-    return { ok: false, error: { code: "EMPTY_CONTENT", message: "input.content is empty", retryable: false } };
-  }
-
-  const warnings = [];
-  let parsedObj = {};
+  let parsed = null;
   let confidence = 0.5;
+  const warnings = [];
 
-  // json strict
-  if (content_type === "json") {
-    const j = tryJsonParse(content);
-    if (!j.ok) {
-      if (mode === "strict") {
-        return { ok: false, error: { code: "PARSE_JSON_FAILED", message: j.error, retryable: false } };
-      }
-      warnings.push("json_parse_failed_best_effort");
-    } else {
-      if (j.value && typeof j.value === "object" && !Array.isArray(j.value)) {
-        parsedObj = j.value;
-      } else {
-        parsedObj = { value: j.value };
-        warnings.push("json_wrapped_non_object");
-      }
+  try {
+    if (content_type === "json") {
+      parsed = parseJsonStrict(content);
       confidence = 0.98;
+    } else if (content_type === "yaml") {
+      parsed = parseYamlBestEffort(content);
+      confidence = mode === "strict" ? 0.85 : 0.75;
+      if (mode === "strict") warnings.push("yaml_strict_mode_is_subset_parser");
+    } else {
+      // best effort: try json then fallback yaml-ish
+      try {
+        parsed = parseJsonStrict(content);
+        confidence = 0.9;
+      } catch {
+        parsed = parseYamlBestEffort(content);
+        confidence = 0.6;
+        warnings.push("best_effort_fallback_parser_used");
+      }
+    }
+  } catch (e) {
+    if (mode === "strict") {
       return {
-        ok: true,
-        result: {
-          parsed: parsedObj,
-          target_schema: target_schema || undefined,
-          confidence,
-          warnings: warnings.length ? warnings : undefined
+        ok: false,
+        error: {
+          code: "PARSE_FAILED",
+          message: String(e?.message ?? e),
+          retryable: false
         }
       };
     }
+    parsed = parseYamlBestEffort(content);
+    confidence = 0.4;
+    warnings.push("parse_failed_then_fallback_parser_used");
   }
 
-  // yaml/yml kv-only subset
-  if (content_type === "yaml" || content_type === "yml") {
-    const y = parseYamlLike(content);
-    parsedObj = y.parsed;
-    warnings.push(...(y.warnings || []));
-    confidence = Object.keys(parsedObj).length ? 0.75 : 0.4;
-    return {
-      ok: true,
-      result: {
-        parsed: parsedObj,
-        target_schema: target_schema || undefined,
-        confidence: clamp01(confidence),
-        warnings: warnings.length ? warnings : undefined
+  const result = { parsed, confidence };
+  if (warnings.length) result.warnings = warnings;
+
+  return { ok: true, result };
+}
+
+// ✅ summarize (deterministic reference summarizer)
+function clampSummaryLen(maxOutputTokens) {
+  // Schema says tokens; runtime returns deterministic text.
+  // Treat as character budget with sane bounds.
+  const n = Number(maxOutputTokens || 0);
+  if (!Number.isFinite(n) || n <= 0) return 800;
+  return Math.max(80, Math.min(n, 32768));
+}
+
+function pickSummaryFormat(req) {
+  const hint = (req?.input?.format_hint || "").toLowerCase().trim();
+  if (["text", "markdown", "html", "json", "other"].includes(hint)) return hint;
+
+  const outs = req?.channel?.output_modalities || [];
+  if (Array.isArray(outs) && outs.map(String).includes("json")) return "json";
+
+  return "text";
+}
+
+function normalizeTextForSummarize(s) {
+  return String(s || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function splitSentences(s) {
+  const out = [];
+  let buf = "";
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    buf += ch;
+    if (ch === "." || ch === "!" || ch === "?") {
+      const next = s[i + 1] || "";
+      if (next === " " || next === "\n" || next === "\t" || next === "") {
+        const t = buf.trim();
+        if (t) out.push(t);
+        buf = "";
       }
-    };
-  }
-
-  // csv
-  if (content_type === "csv") {
-    const c = parseCsv(content);
-    parsedObj = c.parsed;
-    warnings.push(...(c.warnings || []));
-    confidence = (parsedObj?.rows?.length || 0) > 0 ? 0.85 : 0.5;
-    return {
-      ok: true,
-      result: {
-        parsed: parsedObj,
-        target_schema: target_schema || undefined,
-        confidence: clamp01(confidence),
-        warnings: warnings.length ? warnings : undefined
-      }
-    };
-  }
-
-  // log
-  if (content_type === "log") {
-    const l = parseLogLines(content);
-    parsedObj = l.parsed;
-    warnings.push(...(l.warnings || []));
-    confidence = warnings.includes("no_key_value_pairs_detected_in_logs") ? 0.45 : 0.8;
-    return {
-      ok: true,
-      result: {
-        parsed: parsedObj,
-        target_schema: target_schema || undefined,
-        confidence: clamp01(confidence),
-        warnings: warnings.length ? warnings : undefined
-      }
-    };
-  }
-
-  // heuristics best-effort
-  const j2 = tryJsonParse(content);
-  if (j2.ok) {
-    if (j2.value && typeof j2.value === "object" && !Array.isArray(j2.value)) parsedObj = j2.value;
-    else {
-      parsedObj = { value: j2.value };
-      warnings.push("json_wrapped_non_object");
     }
-    confidence = 0.9;
+  }
+  const tail = buf.trim();
+  if (tail) out.push(tail);
+  return out;
+}
+
+function summarizeDeterministic(content, style, maxChars) {
+  const text = normalizeTextForSummarize(content);
+  if (!text) return "";
+
+  if (text.length <= maxChars) return text.slice(0, maxChars);
+
+  const sentences = splitSentences(text);
+  const wantBullets = String(style || "").toLowerCase().includes("bullet");
+
+  const picked = [];
+  let used = 0;
+
+  for (const s of sentences) {
+    const nextLen = s.length + (picked.length ? 1 : 0);
+    if (used + nextLen > maxChars) break;
+    picked.push(s);
+    used += nextLen;
+    if (picked.length >= 6) break;
+  }
+
+  let out;
+  if (picked.length === 0) {
+    out = text.slice(0, maxChars);
+  } else if (wantBullets) {
+    out = picked.map((x) => `- ${x.replace(/^\s*[-•]\s*/, "")}`).join("\n");
   } else {
-    const kv = parseKeyValueLines(content);
-    if (Object.keys(kv.parsed).length) {
-      parsedObj = kv.parsed;
-      warnings.push(...(kv.warnings || []));
-      confidence = 0.7;
-    } else {
-      const l = parseLogLines(content);
-      parsedObj = l.parsed;
-      warnings.push(...(l.warnings || []));
-      warnings.push("best_effort_fallback_log_lines");
-      confidence = 0.55;
-    }
+    out = picked.join(" ");
   }
+
+  if (out.length > maxChars) out = out.slice(0, maxChars);
+  return out;
+}
+
+async function handle_summarize(request) {
+  const content = request?.input?.content ?? "";
+  const maxChars = clampSummaryLen(request?.limits?.max_output_tokens);
+  const format = pickSummaryFormat(request);
+  const style = request?.input?.summary_style || "";
+
+  const normalized = normalizeTextForSummarize(content);
+  const summary = summarizeDeterministic(normalized, style, maxChars);
+
+  const source_hash = sha256Hex(normalized);
+  const inputLen = normalized.length || 0;
+  const outputLen = summary.length || 1;
+  const compression_ratio = inputLen / outputLen;
 
   return {
     ok: true,
     result: {
-      parsed: parsedObj,
-      target_schema: target_schema || undefined,
-      confidence: clamp01(confidence),
-      warnings: warnings.length ? warnings : undefined
+      summary: summary || "(empty summary)",
+      format,
+      compression_ratio,
+      source_hash
     }
   };
 }
 
-// 🧱 Stubs for future verbs (signed receipts, but schema-green only once implemented)
+// Stubs (signed receipts, but schema-green only when implemented)
 async function handler_stub(_request, verb) {
   return {
     ok: false,
@@ -980,15 +871,10 @@ async function handler_stub(_request, verb) {
 const HANDLERS = {
   fetch: (req) => handle_fetch(req),
   describe: (req) => handle_describe(req),
-  clean: (req) => handle_clean(req),
   format: (req) => handle_format(req),
+  clean: (req) => handle_clean(req),
   parse: (req) => handle_parse(req),
-
-  summarize: (req) => handler_stub(req, "summarize"),
-  convert: (req) => handler_stub(req, "convert"),
-  extract: (req) => handler_stub(req, "extract"),
-  classify: (req) => handler_stub(req, "classify"),
-  analyze: (req) => handler_stub(req, "analyze")
+  summarize: (req) => handle_summarize(req)
 };
 
 /* -------------------- runtime route (multi-verb) -------------------- */
@@ -1014,6 +900,7 @@ app.post("/:verb/v1.0.0", async (req, res) => {
     return res.status(400).json({ error: "request schema invalid", verb, details: schemas.vReq.errors });
   }
 
+  // Execute via handler
   const started_at = new Date().toISOString();
   const trace_id = id("trace");
   const handler = HANDLERS[verb];
@@ -1056,7 +943,7 @@ app.post("/:verb/v1.0.0", async (req, res) => {
         error: "receipt schema invalid",
         verb,
         details: schemas.vRcpt.errors,
-        note: "Handler output does not match this verb’s receipt schema yet. Implement the verb handler next."
+        note: "Handler output does not match this verb’s receipt schema yet. Implement/fix the verb handler."
       });
     }
 
