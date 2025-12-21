@@ -1,255 +1,249 @@
 // server.mjs
-console.log("SERVER.MJS BOOTED");
+// CommandLayer reference runtime (commons) — deterministic, schema-valid, receipt-verifiable
+// Verbs: fetch, describe, format, clean, parse, summarize, convert, explain
+//
+// ENV (Railway/shared vars):
+//   ENABLED_VERBS=fetch,describe,format,clean,parse,summarize,convert,explain
+//   ENS_NAME=runtime.commandlayer.eth
+//   VERIFIER_ENS_NAME=runtime.commandlayer.eth
+//   SCHEMA_ENS_TEMPLATE={verb}agent.eth
+//   ETH_RPC_URL=https://mainnet.infura.io/v3/...
+//   RECEIPT_SIGNER_ID=runtime.commandlayer.eth
+//   RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64=... (base64 PEM)
+//   RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64=... (base64 PEM)
+//
+// ENS TXT required on {verb}agent.eth at minimum:
+//   cl.schema.request = https://commandlayer.org/schemas/v1.0.0/commons/<verb>/requests/<verb>.request.schema.json
+//   cl.schema.receipt = https://commandlayer.org/schemas/v1.0.0/commons/<verb>/receipts/<verb>.receipt.schema.json
+//
+// Optional on verifier ENS (VERIFIER_ENS_NAME):
+//   cl.verifier.pubkey_pem = -----BEGIN PUBLIC KEY-----...
+//   cl.verifier.alg = ed25519-sha256
+//
+// Notes:
+// - This runtime is deterministic (non-LLM). "max_output_tokens" is treated as max characters.
+// - Receipt hashing uses stable JSON canonicalization (sorted keys) -> sha256.
+// - Signatures use Ed25519 and are embedded in metadata.proof.signature_b64.
 
 import express from "express";
-import fetch from "node-fetch";
+import cors from "cors";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import crypto from "node:crypto";
-import { ethers } from "ethers";
+import { setTimeout as sleep } from "node:timers/promises";
 
-const app = express();
-app.use(express.json({ limit: "2mb" }));
+import { createPublicClient, http, isAddress } from "viem";
+import { mainnet } from "viem/chains";
+import { normalize } from "viem/ens";
 
-/* -------------------- config -------------------- */
-
-// Runtime identity (used in trace.provider + default signer_id)
-const SERVICE_NAME = process.env.SERVICE_NAME?.trim() || "commandlayer-runtime";
-
-// ENS used to resolve schema TXT records for each verb.
-// Example: "{verb}agent.eth" -> fetchagent.eth, cleanagent.eth, etc.
-const SCHEMA_ENS_TEMPLATE = process.env.SCHEMA_ENS_TEMPLATE?.trim() || "{verb}agent.eth";
-
-// ENS used to resolve verifier public key (cl.receipt.* TXT records).
-const ENS_NAME = process.env.ENS_NAME?.trim() || null;
-const VERIFIER_ENS_NAME = process.env.VERIFIER_ENS_NAME?.trim() || ENS_NAME;
-
-const ETH_RPC_URL = process.env.ETH_RPC_URL?.trim() || null;
-
-// Optional override: if set, ALL verbs use these schema URLs (not recommended for multi-verb)
-const ENV_REQ_URL = process.env.SCHEMA_REQUEST_URL?.trim() || null;
-const ENV_RCPT_URL = process.env.SCHEMA_RECEIPT_URL?.trim() || null;
-
+// -------------------------
+// env + config
+// -------------------------
 const PORT = Number(process.env.PORT || 8080);
-const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 8000);
-const ENS_CACHE_TTL_MS = Number(process.env.ENS_CACHE_TTL_MS || 10 * 60 * 1000); // 10m
 
-// Enabled verbs (supports spaces)
-const ENABLED_VERBS = (process.env.ENABLED_VERBS?.trim() ||
-  "fetch,describe,format,clean,parse,summarize,convert")
+const ENABLED_VERBS = (process.env.ENABLED_VERBS || "fetch")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-/* -------------------- helpers -------------------- */
+const ENS_NAME = (process.env.ENS_NAME || "").trim() || null;
+const VERIFIER_ENS_NAME = (process.env.VERIFIER_ENS_NAME || "").trim() || null;
+const SCHEMA_ENS_TEMPLATE = (process.env.SCHEMA_ENS_TEMPLATE || "{verb}agent.eth").trim();
 
-function id(prefix) {
+const ETH_RPC_URL = (process.env.ETH_RPC_URL || "").trim() || null;
+
+const RECEIPT_SIGNER_ID = (process.env.RECEIPT_SIGNER_ID || "").trim() || (ENS_NAME || "runtime");
+const PRIV_PEM_B64 = (process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64 || "").trim() || null;
+const PUB_PEM_B64 = (process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "").trim() || null;
+
+// cache TTLs
+const VERB_CACHE_TTL_MS = 10 * 60 * 1000; // 10m
+const ENSKEY_CACHE_TTL_MS = 10 * 60 * 1000; // 10m
+
+// -------------------------
+// utilities
+// -------------------------
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function rndId(prefix = "trace") {
   return `${prefix}_${crypto.randomBytes(6).toString("hex")}`;
 }
 
-function sha256Hex(s) {
-  return crypto.createHash("sha256").update(s).digest("hex");
+function b64ToUtf8(b64) {
+  return Buffer.from(b64, "base64").toString("utf8");
 }
 
-function canonicalJson(obj) {
-  // v1: stable-enough canonicalization (insertion order)
-  return JSON.stringify(obj);
+function clampText(s, maxChars) {
+  if (!maxChars || !Number.isFinite(Number(maxChars))) return s;
+  const n = Math.max(1, Number(maxChars));
+  return s.length <= n ? s : s.slice(0, n - 1) + "…";
 }
 
-function readPemB64Env(name) {
-  const b64 = process.env[name]?.trim();
-  if (!b64) return null;
-  try {
-    return Buffer.from(b64, "base64").toString("utf8").trim();
-  } catch {
-    return null;
-  }
+// stable JSON stringify (sorted keys) — avoids provider-specific ordering issues
+function stableStringify(value) {
+  const seen = new WeakSet();
+
+  const sorter = (k, v) => {
+    if (v && typeof v === "object") {
+      if (seen.has(v)) return "[Circular]";
+      seen.add(v);
+      if (Array.isArray(v)) return v.map((x) => x);
+      // sort object keys
+      const out = {};
+      for (const key of Object.keys(v).sort()) out[key] = v[key];
+      return out;
+    }
+    return v;
+  };
+
+  return JSON.stringify(value, sorter);
 }
 
-function recomputeReceiptHash(receipt) {
-  const clone = structuredClone(receipt);
-
-  // Remove proof prior to hashing
-  if (clone?.metadata?.proof) delete clone.metadata.proof;
-
-  // If metadata becomes empty after removing proof, delete it too
-  if (
-    clone?.metadata &&
-    typeof clone.metadata === "object" &&
-    !Array.isArray(clone.metadata) &&
-    Object.keys(clone.metadata).length === 0
-  ) {
-    delete clone.metadata;
-  }
-
-  return sha256Hex(canonicalJson(clone));
+function sha256Hex(str) {
+  return crypto.createHash("sha256").update(str, "utf8").digest("hex");
 }
 
-function signEd25519(hashHex) {
-  const pem = readPemB64Env("RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64");
-  if (!pem) throw new Error("Missing RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64");
-  const msg = Buffer.from(hashHex, "hex");
-  const sig = crypto.sign(null, msg, { key: pem });
+function sha256Bytes(str) {
+  return crypto.createHash("sha256").update(str, "utf8").digest();
+}
+
+function signEd25519(privateKeyPem, messageBytes) {
+  // messageBytes should be a Buffer
+  const sig = crypto.sign(null, messageBytes, privateKeyPem);
   return sig.toString("base64");
 }
 
-function attachReceiptProofOrThrow(receipt) {
-  const hash = recomputeReceiptHash(receipt);
-
-  receipt.metadata = receipt.metadata || {};
-  receipt.metadata.proof = {
-    alg: "ed25519-sha256",
-    canonical: "json-stringify",
-    hash_sha256: hash,
-    signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || SERVICE_NAME,
-    signature_b64: signEd25519(hash),
-  };
-
-  if (!receipt?.metadata?.proof?.signature_b64 || !receipt?.metadata?.proof?.hash_sha256) {
-    throw new Error("INTERNAL: receipt proof missing after signing");
-  }
-
-  return receipt;
-}
-
-function verifyEd25519(hashHex, sigB64, pubPem) {
-  const msg = Buffer.from(hashHex, "hex");
+function verifyEd25519(publicKeyPem, messageBytes, sigB64) {
   const sig = Buffer.from(sigB64, "base64");
-  return crypto.verify(null, msg, { key: pubPem }, sig);
+  return crypto.verify(null, messageBytes, publicKeyPem, sig);
 }
 
-// SSRF guard (demo safety)
-function blocked(url) {
-  try {
-    const u = new URL(url);
-    const h = u.hostname;
-
-    if (u.protocol !== "http:" && u.protocol !== "https:") return true;
-
-    return (
-      h === "localhost" ||
-      h.endsWith(".local") ||
-      h === "::1" ||
-      /^127\./.test(h) ||
-      /^10\./.test(h) ||
-      /^192\.168\./.test(h) ||
-      /^172\.(1[6-9]|2\d|3[0-1])\./.test(h) ||
-      /^169\.254\./.test(h)
-    );
-  } catch {
-    return true;
-  }
+function envPreviewPem(pem) {
+  if (!pem) return null;
+  const s = pem.replace(/\r/g, "");
+  const firstLine = s.split("\n").slice(0, 2).join("\n");
+  return firstLine + "\n…";
 }
 
-function ensForVerb(verb) {
-  return SCHEMA_ENS_TEMPLATE.replaceAll("{verb}", verb);
+// -------------------------
+// ENS read (viem)
+// -------------------------
+const hasRpc = !!ETH_RPC_URL;
+const publicClient = hasRpc
+  ? createPublicClient({
+      chain: mainnet,
+      transport: http(ETH_RPC_URL, { timeout: 15_000 }),
+    })
+  : null;
+
+async function ensGetText(name, key) {
+  if (!publicClient) throw new Error("ETH_RPC_URL not set");
+  const n = normalize(name);
+  return await publicClient.getEnsText({ name: n, key });
 }
 
-function clampStr(s, maxLen) {
-  const v = String(s ?? "");
-  return v.length > maxLen ? v.slice(0, maxLen) : v;
+async function ensResolveAddress(name) {
+  if (!publicClient) throw new Error("ETH_RPC_URL not set");
+  const n = normalize(name);
+  return await publicClient.getEnsAddress({ name: n });
 }
 
-/* -------------------- ENS helpers -------------------- */
+// -------------------------
+// AJV setup
+// -------------------------
+const ajv = new Ajv2020({
+  strict: true,
+  allErrors: true,
+  allowUnionTypes: true,
+  // We're fetching remote schemas ourselves and adding them into AJV.
+  loadSchema: async (uri) => {
+    const res = await fetch(uri, { headers: { "accept": "application/json" } });
+    if (!res.ok) throw new Error(`Failed to load schema: ${uri} (${res.status})`);
+    return await res.json();
+  },
+});
+addFormats(ajv);
 
-async function getProvider() {
-  if (!ETH_RPC_URL) throw new Error("Missing ETH_RPC_URL");
-  return new ethers.JsonRpcProvider(ETH_RPC_URL);
+// -------------------------
+// schema + verb cache
+// -------------------------
+const verbCache = new Map(); // verb -> {mode, ok, ens, reqUrl, rcptUrl, vReq, vRcpt, error, cached_at, expires_at}
+const verifierKeyCache = {
+  has_key: false,
+  cached_at: null,
+  expires_at: null,
+  last_error: null,
+  alg: null,
+  signer_id: null,
+  pubkey_pem: null,
+  pubkey_source: null,
+};
+
+function verbEnsName(verb) {
+  return SCHEMA_ENS_TEMPLATE.replace("{verb}", verb);
 }
 
-async function getResolver(name) {
-  if (!name) throw new Error("Missing ENS name");
-  const provider = await getProvider();
-  const resolver = await provider.getResolver(name);
-  if (!resolver) throw new Error(`No resolver for ${name}`);
-  return resolver;
+async function fetchJson(url) {
+  const res = await fetch(url, { headers: { "accept": "application/json" } });
+  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+  return await res.json();
 }
 
-async function resolveSchemasFromENS(verb) {
-  const name = ensForVerb(verb);
-  const resolver = await getResolver(name);
-  const reqUrl = await resolver.getText("cl.schema.request");
-  const rcptUrl = await resolver.getText("cl.schema.receipt");
-  if (!reqUrl || !rcptUrl) throw new Error(`ENS missing schema TXT records on ${name}`);
-  return { ens: name, reqUrl, rcptUrl };
-}
-
-async function resolveVerifierKeyFromENS() {
-  const resolver = await getResolver(VERIFIER_ENS_NAME);
-
-  const alg = (await resolver.getText("cl.receipt.alg"))?.trim() || null;
-  const signer_id = (await resolver.getText("cl.receipt.signer_id"))?.trim() || null;
-
-  const pubEscaped = await resolver.getText("cl.receipt.pubkey_pem");
-  if (!pubEscaped) throw new Error(`ENS missing cl.receipt.pubkey_pem on ${VERIFIER_ENS_NAME}`);
-
-  const pubkey_pem = pubEscaped.replace(/\\n/g, "\n").trim();
-  return { ens: VERIFIER_ENS_NAME, alg, signer_id, pubkey_pem };
-}
-
-/* -------------------- schema cache per verb -------------------- */
-
-const verbSchemaCache = new Map(); // verb -> { mode, ok, ens, reqUrl, rcptUrl, vReq, vRcpt, error, cached_at, expires_at }
-
-function verbCacheValid(verb) {
-  const v = verbSchemaCache.get(verb);
-  if (!v?.expires_at) return false;
-  return Date.now() < Date.parse(v.expires_at);
-}
-
-async function buildValidators(reqUrl, rcptUrl) {
-  const ajv = new Ajv2020({
-    strict: true,
-    allErrors: true,
-    loadSchema: async (uri) => (await fetch(uri)).json(),
-  });
-  addFormats(ajv);
-
-  const reqSchema = await (await fetch(reqUrl)).json();
-  const rcptSchema = await (await fetch(rcptUrl)).json();
-
-  const vReq = await ajv.compileAsync(reqSchema);
-  const vRcpt = await ajv.compileAsync(rcptSchema);
-
-  return { vReq, vRcpt };
-}
-
-async function getVerbSchemas(verb, { refresh = false } = {}) {
-  if (!refresh && verbCacheValid(verb)) return verbSchemaCache.get(verb);
-
+async function ensureVerbSchemas(verb, { refresh = false } = {}) {
+  const cached = verbCache.get(verb);
   const now = Date.now();
-  const entry = {
-    mode: "booting",
-    ok: false,
-    ens: null,
-    reqUrl: null,
-    rcptUrl: null,
-    vReq: null,
-    vRcpt: null,
-    error: null,
-    cached_at: new Date(now).toISOString(),
-    expires_at: new Date(now + ENS_CACHE_TTL_MS).toISOString(),
-  };
+  if (!refresh && cached && cached.expires_at && new Date(cached.expires_at).getTime() > now) {
+    return cached;
+  }
 
-  verbSchemaCache.set(verb, entry);
+  const cached_at = nowIso();
+  const expires_at = new Date(now + VERB_CACHE_TTL_MS).toISOString();
+
+  // If no ENS, we still allow schemas to be provided by request.x402? not in this reference runtime.
+  // This runtime expects ENS TXT records to point at schema URLs.
+  const ens = verbEnsName(verb);
+
+  let reqUrl = null;
+  let rcptUrl = null;
 
   try {
-    // Optional global env override (not recommended when serving many verbs)
-    let reqUrl = ENV_REQ_URL;
-    let rcptUrl = ENV_RCPT_URL;
-    let ens = null;
+    reqUrl = await ensGetText(ens, "cl.schema.request");
+    rcptUrl = await ensGetText(ens, "cl.schema.receipt");
 
     if (!reqUrl || !rcptUrl) {
-      const resolved = await resolveSchemasFromENS(verb);
-      ens = resolved.ens;
-      reqUrl = resolved.reqUrl;
-      rcptUrl = resolved.rcptUrl;
+      const error = `ENS missing schema TXT records on ${ens}`;
+      const degraded = {
+        mode: "degraded",
+        ok: false,
+        ens: null,
+        reqUrl: null,
+        rcptUrl: null,
+        vReq: null,
+        vRcpt: null,
+        error,
+        cached_at,
+        expires_at,
+      };
+      verbCache.set(verb, degraded);
+      return degraded;
     }
 
-    const { vReq, vRcpt } = await buildValidators(reqUrl, rcptUrl);
+    // Load + compile
+    const reqSchema = await fetchJson(reqUrl);
+    const rcptSchema = await fetchJson(rcptUrl);
+
+    // Add into AJV with IDs so refs resolve
+    ajv.removeSchema(reqUrl);
+    ajv.removeSchema(rcptUrl);
+    ajv.addSchema(reqSchema, reqUrl);
+    ajv.addSchema(rcptSchema, rcptUrl);
+
+    const vReq = await ajv.compileAsync(reqSchema);
+    const vRcpt = await ajv.compileAsync(rcptSchema);
 
     const ready = {
-      ...entry,
       mode: "ready",
       ok: true,
       ens,
@@ -258,276 +252,280 @@ async function getVerbSchemas(verb, { refresh = false } = {}) {
       vReq,
       vRcpt,
       error: null,
+      cached_at,
+      expires_at,
     };
-
-    verbSchemaCache.set(verb, ready);
+    verbCache.set(verb, ready);
     return ready;
   } catch (e) {
     const degraded = {
-      ...entry,
       mode: "degraded",
       ok: false,
-      error: String(e?.message ?? e),
+      ens: null,
+      reqUrl: null,
+      rcptUrl: null,
+      vReq: null,
+      vRcpt: null,
+      error: String(e?.message || e),
+      cached_at,
+      expires_at,
     };
-    verbSchemaCache.set(verb, degraded);
+    verbCache.set(verb, degraded);
     return degraded;
   }
 }
 
-/* -------------------- ENS verifier key cache -------------------- */
+async function ensureVerifierEnsKey({ refresh = false } = {}) {
+  const now = Date.now();
+  if (!refresh && verifierKeyCache.expires_at && new Date(verifierKeyCache.expires_at).getTime() > now) {
+    return verifierKeyCache;
+  }
 
-let ensKeyCache = null; // { ens, alg, signer_id, pubkey_pem, cached_at, expires_at, error }
+  verifierKeyCache.cached_at = nowIso();
+  verifierKeyCache.expires_at = new Date(now + ENSKEY_CACHE_TTL_MS).toISOString();
+  verifierKeyCache.last_error = null;
+  verifierKeyCache.has_key = false;
+  verifierKeyCache.alg = "ed25519-sha256";
+  verifierKeyCache.signer_id = VERIFIER_ENS_NAME || null;
+  verifierKeyCache.pubkey_pem = null;
+  verifierKeyCache.pubkey_source = null;
 
-function keyCacheValid() {
-  if (!ensKeyCache?.pubkey_pem || !ensKeyCache?.expires_at) return false;
-  return Date.now() < Date.parse(ensKeyCache.expires_at);
+  if (!VERIFIER_ENS_NAME) {
+    verifierKeyCache.last_error = "VERIFIER_ENS_NAME not set";
+    return verifierKeyCache;
+  }
+  if (!publicClient) {
+    verifierKeyCache.last_error = "ETH_RPC_URL not set";
+    return verifierKeyCache;
+  }
+
+  try {
+    // First ensure ENS has a resolver
+    const addr = await ensResolveAddress(VERIFIER_ENS_NAME);
+    // Even if address is null, resolver might exist — but this is a cheap check. We'll still try text records.
+    // If addr is null and text read fails, we report resolver issue from text read.
+    void addr;
+
+    // Prefer standard key; you can change this later.
+    const pub = await ensGetText(VERIFIER_ENS_NAME, "cl.verifier.pubkey_pem");
+    const alg = (await ensGetText(VERIFIER_ENS_NAME, "cl.verifier.alg")) || "ed25519-sha256";
+
+    if (!pub) {
+      verifierKeyCache.last_error = `Missing cl.verifier.pubkey_pem on ${VERIFIER_ENS_NAME}`;
+      return verifierKeyCache;
+    }
+
+    verifierKeyCache.has_key = true;
+    verifierKeyCache.alg = alg;
+    verifierKeyCache.pubkey_pem = pub;
+    verifierKeyCache.pubkey_source = "ens";
+    return verifierKeyCache;
+  } catch (e) {
+    // Common failure: no resolver / text read fails
+    verifierKeyCache.last_error = String(e?.message || e);
+    return verifierKeyCache;
+  }
 }
 
-async function getEnsVerifierKey({ refresh = false } = {}) {
-  if (!refresh && keyCacheValid()) return { ...ensKeyCache, source: "ens-cache" };
+// -------------------------
+// receipt build + verify
+// -------------------------
+function getEnvSignerKeys() {
+  // sign with env keys
+  const privPem = PRIV_PEM_B64 ? b64ToUtf8(PRIV_PEM_B64) : null;
+  const pubPem = PUB_PEM_B64 ? b64ToUtf8(PUB_PEM_B64) : null;
+  return { privPem, pubPem };
+}
 
-  const now = Date.now();
-  const k = await resolveVerifierKeyFromENS();
+function buildReceipt({ verb, version, entry, trace, result, request }) {
+  const { privPem } = getEnvSignerKeys();
+  if (!privPem) throw new Error("Missing RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64");
 
-  ensKeyCache = {
-    ...k,
-    cached_at: new Date(now).toISOString(),
-    expires_at: new Date(now + ENS_CACHE_TTL_MS).toISOString(),
-    error: null,
+  const base = {
+    status: "success",
+    x402: { entry, verb, version },
+    trace,
+    result,
+    // metadata will be added below
   };
 
-  return { ...ensKeyCache, source: "ens" };
+  const canonical = "json-stringify";
+
+  // IMPORTANT: hash should bind the full receipt payload minus the signature itself.
+  // We put proof.hash_sha256 + signature_b64 in metadata.proof.
+  // To avoid recursion, we compute hash over a copy WITHOUT signature_b64 and WITHOUT hash_sha256.
+  const unsigned = structuredClone(base);
+  unsigned.metadata = {
+    proof: {
+      alg: "ed25519-sha256",
+      canonical,
+      signer_id: RECEIPT_SIGNER_ID,
+      // hash_sha256 + signature_b64 filled after hashing/signing
+    },
+    // optional: echo some safe request hints
+    request: {
+      actor: request?.actor ?? null,
+    },
+  };
+
+  // Compute hash over unsigned receipt with empty proof fields removed
+  const hashInputObj = structuredClone(unsigned);
+  delete hashInputObj.metadata.proof.hash_sha256;
+  delete hashInputObj.metadata.proof.signature_b64;
+
+  const canonicalStr = stableStringify(hashInputObj);
+  const hashHex = sha256Hex(canonicalStr);
+  const sigB64 = signEd25519(privPem, sha256Bytes(canonicalStr));
+
+  // Final receipt
+  unsigned.metadata.proof.hash_sha256 = hashHex;
+  unsigned.metadata.proof.signature_b64 = sigB64;
+
+  return unsigned;
 }
 
-/* -------------------- always-on routes -------------------- */
-
-app.get("/health", (_req, res) => res.status(200).send("ok"));
-
-app.get("/debug/env", (_req, res) => {
-  let signer_ok = false;
-  let signer_error = null;
-
-  try {
-    signEd25519(sha256Hex("debug"));
-    signer_ok = true;
-  } catch (e) {
-    signer_error = String(e?.message ?? e);
-  }
-
-  const pubEnv = readPemB64Env("RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64");
-
-  res.json({
-    ok: true,
-    node: process.version,
-    cwd: process.cwd(),
-    port: PORT,
-    service: SERVICE_NAME,
-
-    ens_name: ENS_NAME,
-    verifier_ens_name: VERIFIER_ENS_NAME,
-    schema_ens_template: SCHEMA_ENS_TEMPLATE,
-
-    has_rpc: Boolean(ETH_RPC_URL),
-    enabled_verbs: ENABLED_VERBS,
-
-    ping_test: process.env.PING_TEST || null,
-
-    signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || SERVICE_NAME,
-    signer_ok,
-    signer_error,
-
-    has_priv_b64: Boolean(process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64),
-    has_pub_b64: Boolean(process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64),
-    pub_env_preview: pubEnv ? pubEnv.slice(0, 30) + "..." : null,
-
-    ens_verifier_cache: {
-      has_key: Boolean(ensKeyCache?.pubkey_pem),
-      cached_at: ensKeyCache?.cached_at || null,
-      expires_at: ensKeyCache?.expires_at || null,
-      last_error: ensKeyCache?.error || null,
+async function verifyReceipt(receipt, { ens = false, refresh = false } = {}) {
+  const out = {
+    ok: false,
+    checks: { schema_valid: false, hash_matches: false, signature_valid: false },
+    values: {
+      verb: null,
+      signer_id: null,
+      alg: null,
+      canonical: null,
+      claimed_hash: null,
+      recomputed_hash: null,
+      pubkey_source: null,
     },
-  });
-});
+    errors: { schema_errors: null, signature_error: null },
+  };
 
-app.get("/debug/enskey", async (_req, res) => {
   try {
-    const k = await getEnsVerifierKey({ refresh: true });
-    res.json({
-      ok: true,
-      ens: k.ens,
-      alg: k.alg,
-      signer_id: k.signer_id,
-      pubkey_source: k.source,
-      pubkey_preview: k.pubkey_pem.slice(0, 40) + "...",
-      cached_at: k.cached_at,
-      expires_at: k.expires_at,
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message ?? e) });
-  }
-});
+    if (!receipt || typeof receipt !== "object") throw new Error("receipt must be JSON object");
 
-app.get("/debug/verbs", async (req, res) => {
-  const refresh = String(req.query?.refresh || "") === "1";
-  const out = {};
-  for (const verb of ENABLED_VERBS) {
-    const s = await getVerbSchemas(verb, { refresh });
-    out[verb] = {
-      mode: s.mode,
-      ok: s.ok,
-      ens: s.ens,
-      reqUrl: s.reqUrl,
-      rcptUrl: s.rcptUrl,
-      error: s.error || null,
-      cached_at: s.cached_at,
-      expires_at: s.expires_at,
-    };
-  }
-  res.json({ ok: true, verbs: out });
-});
+    const verb = receipt?.x402?.verb;
+    out.values.verb = verb || null;
 
-/* -------------------- /verify -------------------- */
-
-app.post("/verify", async (req, res) => {
-  try {
-    const receipt = req.body;
-    const proof = receipt?.metadata?.proof || null;
-
+    const proof = receipt?.metadata?.proof;
     if (!proof?.signature_b64 || !proof?.hash_sha256) {
-      return res.status(400).json({ ok: false, error: "missing metadata.proof.signature_b64 or hash_sha256" });
+      throw new Error("missing metadata.proof.signature_b64 or hash_sha256");
     }
 
-    // Best-effort schema validation using receipt.x402.verb
-    const verb = receipt?.x402?.verb?.trim?.() || null;
-    let schema_valid = false;
-    let schema_errors = null;
+    out.values.signer_id = proof.signer_id || null;
+    out.values.alg = proof.alg || null;
+    out.values.canonical = proof.canonical || null;
+    out.values.claimed_hash = proof.hash_sha256 || null;
 
-    if (verb && ENABLED_VERBS.includes(verb)) {
-      const s = await getVerbSchemas(verb);
-      if (s?.vRcpt) schema_valid = Boolean(s.vRcpt(receipt));
-      schema_errors = s?.vRcpt ? (s.vRcpt.errors || null) : [{ message: "receipt validator not ready", schemaState: s }];
+    // 1) schema validation
+    if (!verb || typeof verb !== "string") throw new Error("missing x402.verb");
+
+    const v = await ensureVerbSchemas(verb, { refresh });
+    if (!v.ok) throw new Error(`schemas not ready: ${v.error}`);
+
+    const valid = v.vRcpt(receipt);
+    if (!valid) {
+      out.errors.schema_errors = v.vRcpt.errors || null;
+      out.checks.schema_valid = false;
+      // still attempt hash/signature to help debug, but keep schema false
     } else {
-      schema_valid = false;
-      schema_errors = [{ message: "unknown verb for schema validation", verb }];
+      out.checks.schema_valid = true;
     }
 
-    const recomputed_hash = recomputeReceiptHash(receipt);
-    const claimed_hash = String(proof.hash_sha256);
-    const hash_matches = recomputed_hash === claimed_hash;
+    // 2) hash recompute
+    const unsigned = structuredClone(receipt);
+    // remove signature/hash from proof before recomputing
+    if (unsigned?.metadata?.proof) {
+      delete unsigned.metadata.proof.signature_b64;
+      delete unsigned.metadata.proof.hash_sha256;
+    }
 
-    const requireEns = String(req.query?.ens || "") === "1";
-    const refresh = String(req.query?.refresh || "") === "1";
+    const canonicalStr = stableStringify(unsigned);
+    const recomputed = sha256Hex(canonicalStr);
+    out.values.recomputed_hash = recomputed;
+    out.checks.hash_matches = recomputed === proof.hash_sha256;
 
+    // 3) signature verify — choose pubkey from ENS (if ens=1) else env-b64
     let pubPem = null;
     let pubkey_source = null;
 
-    if (requireEns) {
-      const k = await getEnsVerifierKey({ refresh });
+    if (ens) {
+      const k = await ensureVerifierEnsKey({ refresh });
+      if (!k.has_key) throw new Error(k.last_error || "ENS key not available");
       pubPem = k.pubkey_pem;
-      pubkey_source = k.source;
+      pubkey_source = "ens";
     } else {
-      pubPem = readPemB64Env("RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64");
-      pubkey_source = pubPem ? "env-b64" : null;
+      const env = getEnvSignerKeys();
+      if (!env.pubPem) throw new Error("Missing RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64");
+      pubPem = env.pubPem;
+      pubkey_source = "env-b64";
     }
 
-    if (!pubPem) {
-      return res.status(503).json({
-        ok: false,
-        error: requireEns ? "ENS verifier key unavailable" : "Missing RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64",
-      });
-    }
+    out.values.pubkey_source = pubkey_source;
 
-    let signature_valid = false;
-    let signature_error = null;
-    try {
-      signature_valid = verifyEd25519(recomputed_hash, proof.signature_b64, pubPem);
-    } catch (e) {
-      signature_error = String(e?.message ?? e);
-      signature_valid = false;
-    }
+    const okSig = verifyEd25519(pubPem, sha256Bytes(canonicalStr), proof.signature_b64);
+    out.checks.signature_valid = okSig;
 
-    return res.json({
-      ok: true,
-      checks: { schema_valid, hash_matches, signature_valid },
-      values: {
-        verb,
-        signer_id: proof.signer_id || null,
-        alg: proof.alg || null,
-        canonical: proof.canonical || null,
-        claimed_hash,
-        recomputed_hash,
-        pubkey_source,
-      },
-      errors: { schema_errors, signature_error },
-    });
+    out.ok = out.checks.schema_valid && out.checks.hash_matches && out.checks.signature_valid;
+    return out;
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message ?? e) });
+    out.ok = false;
+    out.errors.signature_error = null;
+    return { ...out, error: String(e?.message || e) };
   }
-});
+}
 
-/* -------------------- verb handlers -------------------- */
+// -------------------------
+// verb handlers (deterministic)
+// -------------------------
+async function handle_fetch(req) {
+  const input = req?.input || req || {};
+  const source = input.source || input.url || input?.input?.source;
+  const query = input.query ?? null;
+  const include_metadata = input.include_metadata ?? null;
 
-// ✅ Real handler (already proven)
-async function handle_fetch(request) {
-  const url = request.source;
-  if (blocked(url)) {
-    return { ok: false, error: { code: "BAD_SOURCE", message: "blocked or invalid source", retryable: false } };
-  }
-
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
-  let r, text;
-  try {
-    r = await fetch(url, { signal: controller.signal });
-    text = await r.text();
-  } finally {
-    clearTimeout(t);
+  if (!source || typeof source !== "string") {
+    return { ok: false, error: "input.source is required" };
   }
 
-  const headers = {};
-  r.headers.forEach((v, k) => (headers[k] = v));
+  const res = await fetch(source, { redirect: "follow" });
+  const text = await res.text();
+  const preview = clampText(text, 1800);
 
   return {
     ok: true,
     result: {
       items: [
         {
-          source: url,
-          query: request.query ?? null,
-          include_metadata: request.include_metadata ?? null,
-          ok: r.ok,
-          http_status: r.status,
-          headers,
-          body_preview: (text || "").slice(0, 2000),
+          source,
+          query,
+          include_metadata,
+          ok: res.ok,
+          http_status: res.status,
+          headers: Object.fromEntries(res.headers.entries()),
+          body_preview: preview,
         },
       ],
     },
   };
 }
 
-/* -------- describe (deterministic reference output) -------- */
+async function handle_describe(req) {
+  const input = req?.input || {};
+  const subject = String(input.subject || "").trim();
+  const audience = input.audience ? String(input.audience).trim() : "general";
+  const detail = input.detail_level || "medium";
+  const maxOut = req?.limits?.max_output_tokens;
 
-function buildDescribeText(subject, detail_level, audience) {
-  const s = clampStr(subject, 200);
-  const dl = detail_level || "medium";
-  const aud = audience || "general";
-
-  if (dl === "short") {
-    return `**${s}** is a CommandLayer concept: a standard “API meaning” contract agents can call using published schemas and receipts.`;
+  let description = "";
+  if (detail === "short") {
+    description = `**${subject}**: a named subject described deterministically for **${audience}**.`;
+  } else if (detail === "long") {
+    description =
+      `**${subject}**: a deterministic reference description produced by a CommandLayer runtime (non-LLM).\n\n` +
+      `It returns schema-valid output and a receipt you can verify (schema + hash + signature).`;
+  } else {
+    description = `**${subject}** described for **${audience}** with stable, deterministic formatting.`;
   }
-  if (dl === "long") {
-    return `**${s}** is described in CommandLayer terms as a semantic contract: a stable verb+schema interface whose outputs are issued as verifiable receipts. This enables interoperability across runtimes (swap execution without breaking meaning) and post-hoc verification (hash + signature). Audience: ${aud}.`;
-  }
-  return `**${s}** is a semantic contract surface in CommandLayer: verbs + schemas define meaning, and receipts provide verifiable evidence of execution.`;
-}
-
-async function handle_describe(request) {
-  const subject = request?.input?.subject ?? "Unknown";
-  const detail_level = request?.input?.detail_level ?? "medium";
-  const audience = request?.input?.audience ?? "general";
-
-  const description = buildDescribeText(subject, detail_level, audience);
 
   const bullets = [
     "Schemas define meaning (requests + receipts).",
@@ -535,608 +533,581 @@ async function handle_describe(request) {
     "Receipts can be independently verified (hash + signature).",
   ];
 
-  const properties = {
-    verb: "describe",
-    version: "1.0.0",
-    audience: String(audience),
-    detail_level: String(detail_level),
-  };
-
   return {
     ok: true,
     result: {
-      description,
+      description: clampText(description, maxOut),
       bullets,
-      properties,
+      properties: {
+        verb: "describe",
+        version: "1.0.0",
+        audience,
+        detail_level: detail,
+      },
     },
   };
 }
 
-/* -------- format (deterministic reference formatter) -------- */
+async function handle_format(req) {
+  const input = req?.input || {};
+  const content = String(input.content ?? "").toString();
+  const target = (input.target_style || "text").toString().toLowerCase();
+  const maxOut = req?.limits?.max_output_tokens;
 
-function parseLooseKVLines(s) {
-  // Accept "a: 1" lines (very small YAML-ish)
-  const out = [];
-  const lines = String(s ?? "").split(/\r?\n/).filter((x) => x.trim().length);
-  for (const line of lines) {
-    const m = line.match(/^\s*([^:#]+?)\s*:\s*(.*?)\s*$/);
-    if (m) out.push([m[1].trim(), m[2].trim()]);
-  }
-  return out;
-}
+  let formatted = content;
+  let style = target;
 
-function toMarkdownTable(pairs) {
-  const rows = pairs.map(([k, v]) => [String(k), String(v)]);
-  const header = `| key | value |\n|---|---|`;
-  const body = rows.map(([k, v]) => `| ${k} | ${v} |`).join("\n");
-  return `${header}\n${body}`;
-}
-
-async function handle_format(request) {
-  const content = request?.input?.content ?? "";
-  const target_style = (request?.input?.target_style ?? "text").toString();
-
-  const original_length = String(content).length;
-  const warnings = [];
-
-  let formatted_content = String(content);
-  let style = target_style;
-
-  if (target_style === "table") {
-    const pairs = parseLooseKVLines(content);
-    if (pairs.length) {
-      formatted_content = toMarkdownTable(pairs);
-      style = "table";
-    } else {
-      warnings.push("No key:value lines detected; returning original content.");
-      formatted_content = String(content);
-      style = "text";
+  if (target === "table") {
+    // naive key/value table: parse lines "k: v"
+    const lines = content.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    const rows = [];
+    for (const l of lines) {
+      const m = l.match(/^([^:]+):\s*(.*)$/);
+      if (m) rows.push([m[1].trim(), m[2].trim()]);
     }
-  } else if (target_style === "json_pretty") {
+    formatted = `| key | value |\n|---|---|\n` + rows.map(([k, v]) => `| ${k} | ${v} |`).join("\n");
+    style = "table";
+  } else if (target === "json_pretty") {
     try {
-      const obj = JSON.parse(String(content));
-      formatted_content = JSON.stringify(obj, null, 2);
+      const obj = JSON.parse(content);
+      formatted = JSON.stringify(obj, null, 2);
       style = "json_pretty";
     } catch {
-      warnings.push("Invalid JSON; returning original content.");
-      formatted_content = String(content);
+      formatted = content;
       style = "text";
     }
-  } else {
-    style = target_style;
-    formatted_content = String(content);
+  } else if (target === "trim") {
+    formatted = content.trim();
+    style = "trim";
   }
 
-  const formatted_length = formatted_content.length;
+  formatted = clampText(formatted, maxOut);
 
   return {
     ok: true,
     result: {
-      formatted_content,
+      formatted_content: formatted,
       style,
-      original_length,
-      formatted_length,
+      original_length: content.length,
+      formatted_length: formatted.length,
       notes: "Deterministic reference formatter (non-LLM).",
-      ...(warnings.length ? { warnings } : {}),
     },
   };
 }
 
-/* -------- clean (deterministic normalizer) -------- */
+async function handle_clean(req) {
+  const input = req?.input || {};
+  let content = String(input.content ?? "");
+  const ops = Array.isArray(input.operations) ? input.operations : [];
+  const maxOut = req?.limits?.max_output_tokens;
 
-function normalizeNewlines(s) {
-  return String(s ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-}
-function collapseWhitespace(s) {
-  return String(s ?? "").replace(/[ \t]+/g, " ");
-}
-function trim(s) {
-  return String(s ?? "").trim();
-}
-function removeEmptyLines(s) {
-  return String(s ?? "")
-    .split("\n")
-    .map((l) => l.trimEnd())
-    .filter((l) => l.trim().length > 0)
-    .join("\n");
-}
-function redactEmails(s) {
-  // Simple email regex (best-effort)
-  const re = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
-  const had = re.test(String(s ?? ""));
-  const out = String(s ?? "").replace(re, "[redacted-email]");
-  return { out, had };
-}
+  const issues = [];
 
-async function handle_clean(request) {
-  const content = request?.input?.content ?? "";
-  const ops = Array.isArray(request?.input?.operations) ? request.input.operations : [];
+  const normalize_newlines = () => { content = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n"); };
+  const collapse_whitespace = () => { content = content.replace(/[ \t]+/g, " "); };
+  const trim = () => { content = content.trim(); };
+  const remove_empty_lines = () => {
+    content = content
+      .split("\n")
+      .map((l) => l.trimEnd())
+      .filter((l) => l.trim().length > 0)
+      .join("\n");
+  };
+  const redact_emails = () => {
+    const before = content;
+    content = content.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[redacted-email]");
+    if (content !== before) issues.push("emails_redacted");
+  };
 
-  const original_length = String(content).length;
-  let s = String(content);
-  const operations_applied = [];
-  const issues_detected = [];
-  const warnings = [];
+  const map = {
+    normalize_newlines,
+    collapse_whitespace,
+    trim,
+    remove_empty_lines,
+    redact_emails,
+  };
 
+  const original = content;
+  const applied = [];
   for (const op of ops) {
-    const o = String(op);
-    if (o === "normalize_newlines") {
-      s = normalizeNewlines(s);
-      operations_applied.push(o);
-    } else if (o === "collapse_whitespace") {
-      s = collapseWhitespace(s);
-      operations_applied.push(o);
-    } else if (o === "trim") {
-      s = trim(s);
-      operations_applied.push(o);
-    } else if (o === "remove_empty_lines") {
-      s = removeEmptyLines(s);
-      operations_applied.push(o);
-    } else if (o === "redact_emails") {
-      const { out, had } = redactEmails(s);
-      s = out;
-      operations_applied.push(o);
-      if (had) issues_detected.push("emails_redacted");
+    if (map[op]) {
+      map[op]();
+      applied.push(op);
+    }
+  }
+
+  content = clampText(content, maxOut);
+
+  return {
+    ok: true,
+    result: {
+      cleaned_content: content,
+      original_length: original.length,
+      cleaned_length: content.length,
+      operations_applied: applied,
+      issues_detected: issues,
+    },
+  };
+}
+
+async function handle_parse(req) {
+  const input = req?.input || {};
+  const raw = String(input.content ?? "");
+  const type = (input.content_type || "").toString().toLowerCase();
+  const mode = (input.mode || "best_effort").toString();
+  const maxOut = req?.limits?.max_output_tokens;
+
+  let parsed = null;
+  let confidence = 0.6;
+  const warnings = [];
+
+  const tryJson = () => {
+    parsed = JSON.parse(raw);
+    confidence = 0.98;
+  };
+
+  const tryYamlKV = () => {
+    // very naive "k: v" YAML-ish parser
+    const obj = {};
+    for (const line of raw.split(/\r?\n/)) {
+      const l = line.trim();
+      if (!l || l.startsWith("#")) continue;
+      const m = l.match(/^([^:]+):\s*(.*)$/);
+      if (m) obj[m[1].trim()] = m[2].trim();
+    }
+    parsed = obj;
+    confidence = 0.75;
+  };
+
+  try {
+    if (type === "json") {
+      tryJson();
+    } else if (type === "yaml") {
+      tryYamlKV();
+    } else if (type === "csv") {
+      // naive CSV -> array of objects (headers first row)
+      const rows = raw.split(/\r?\n/).filter(Boolean).map((r) => r.split(","));
+      const headers = rows.shift() || [];
+      parsed = rows.map((r) => Object.fromEntries(headers.map((h, i) => [h, r[i] ?? ""])));
+      confidence = 0.7;
     } else {
-      warnings.push(`Unknown operation '${o}' ignored.`);
-    }
-  }
-
-  // If no ops specified, do a safe default: normalize + trim
-  if (operations_applied.length === 0) {
-    s = trim(normalizeNewlines(s));
-    operations_applied.push("normalize_newlines", "trim");
-  }
-
-  const cleaned_length = s.length;
-
-  return {
-    ok: true,
-    result: {
-      cleaned_content: s,
-      original_length,
-      cleaned_length,
-      operations_applied,
-      ...(issues_detected.length ? { issues_detected } : {}),
-      ...(warnings.length ? { warnings } : {}),
-    },
-  };
-}
-
-/* -------- parse (deterministic reference parser) -------- */
-
-function tryJsonParse(s) {
-  return JSON.parse(String(s));
-}
-
-function parseLooseYamlKV(s) {
-  const pairs = parseLooseKVLines(s);
-  const obj = {};
-  for (const [k, v] of pairs) obj[k] = v;
-  return obj;
-}
-
-async function handle_parse(request) {
-  const content = request?.input?.content ?? "";
-  const content_type = (request?.input?.content_type ?? "").toString().toLowerCase();
-  const mode = (request?.input?.mode ?? "best_effort").toString();
-
-  let parsed = {};
-  let confidence = 0.5;
-  const warnings = [];
-
-  if (content_type === "json") {
-    try {
-      parsed = tryJsonParse(content);
-      confidence = 0.98;
-    } catch (e) {
+      // best-effort
       if (mode === "strict") {
-        // Strict: return “best-effort but schema-green”
-        warnings.push("Invalid JSON in strict mode; returning empty object.");
-        parsed = {};
-        confidence = 0.01;
+        warnings.push("unknown content_type for strict mode");
+        parsed = { raw };
+        confidence = 0.4;
       } else {
-        warnings.push("Invalid JSON; falling back to empty object.");
-        parsed = {};
-        confidence = 0.05;
+        try {
+          tryJson();
+        } catch {
+          tryYamlKV();
+        }
       }
     }
-  } else if (content_type === "yaml") {
-    // Minimal YAML-ish: key: value lines
-    parsed = parseLooseYamlKV(content);
-    confidence = Object.keys(parsed).length ? 0.75 : 0.2;
-    if (!Object.keys(parsed).length) warnings.push("No key:value pairs detected.");
-  } else {
-    // Default: attempt JSON, else fallback to kv pairs, else raw wrapper
-    try {
-      parsed = tryJsonParse(content);
-      confidence = 0.9;
-      warnings.push("content_type not provided; inferred JSON.");
-    } catch {
-      const obj = parseLooseYamlKV(content);
-      if (Object.keys(obj).length) {
-        parsed = obj;
-        confidence = 0.6;
-        warnings.push("content_type not provided; inferred key:value lines.");
-      } else {
-        parsed = { text: String(content) };
-        confidence = 0.3;
-        warnings.push("content_type not provided; returning raw text wrapper.");
-      }
-    }
+  } catch (e) {
+    if (mode === "strict") throw e;
+    parsed = { raw };
+    confidence = 0.2;
+    warnings.push("parse_failed_best_effort");
+  }
+
+  // clamp output size by stringifying and trimming (so receipts stay small)
+  const parsedStr = stableStringify(parsed);
+  const clampedParsedStr = clampText(parsedStr, maxOut);
+  let finalParsed = parsed;
+  if (clampedParsedStr !== parsedStr) {
+    finalParsed = { _truncated: true, raw: clampedParsedStr };
+    warnings.push("parsed_truncated_to_limits");
+    confidence = Math.min(confidence, 0.5);
   }
 
   return {
     ok: true,
     result: {
-      parsed,
+      parsed: finalParsed,
       confidence,
-      ...(request?.input?.target_schema ? { target_schema: String(request.input.target_schema) } : {}),
       ...(warnings.length ? { warnings } : {}),
+      ...(input.target_schema ? { target_schema: String(input.target_schema) } : {}),
     },
   };
 }
 
-/* -------- summarize (deterministic reference summarizer) -------- */
+async function handle_summarize(req) {
+  const input = req?.input || {};
+  const content = String(input.content ?? "");
+  const style = (input.summary_style || "text").toString().toLowerCase();
+  const format = (input.format_hint || "text").toString().toLowerCase();
+  const maxOut = req?.limits?.max_output_tokens;
 
-function summarizeBullets(text, maxChars) {
-  const s = String(text ?? "").trim();
-  if (!s) return "";
-
-  // Split into sentences-ish
-  const parts = s
-    .replace(/\s+/g, " ")
-    .split(/(?<=[.!?])\s+/)
-    .filter(Boolean);
-
-  const bullets = [];
-  for (const p of parts.slice(0, 6)) {
-    bullets.push(`- ${p}`);
-  }
-  const out = bullets.join("\n");
-  return out.length > maxChars ? out.slice(0, maxChars) : out;
-}
-
-function summarizePlain(text, maxChars) {
-  const s = String(text ?? "").replace(/\s+/g, " ").trim();
-  if (s.length <= maxChars) return s;
-  return s.slice(0, Math.max(0, maxChars - 1)) + "…";
-}
-
-async function handle_summarize(request) {
-  const content = request?.input?.content ?? "";
-  const format_hint = (request?.input?.format_hint ?? "text").toString();
-  const summary_style = (request?.input?.summary_style ?? "text").toString();
-
-  const maxOut = Number(request?.limits?.max_output_tokens ?? 400);
-  const maxChars = Math.max(32, Math.min(25000, maxOut * 4)); // rough
-
+  // Deterministic "summary": either first N chars or bullet split by sentences
   let summary = "";
-  let format = "text";
-  const warnings = [];
-
-  if (summary_style === "bullet_points") {
-    summary = summarizeBullets(content, maxChars);
-    format = format_hint === "markdown" ? "markdown" : "text";
+  if (style.includes("bullet")) {
+    const sentences = content
+      .replace(/\s+/g, " ")
+      .split(/(?<=[.!?])\s+/)
+      .filter(Boolean)
+      .slice(0, 6);
+    summary = sentences.map((s) => `- ${s}`).join("\n");
   } else {
-    summary = summarizePlain(content, maxChars);
-    format = format_hint === "markdown" ? "markdown" : "text";
+    summary = content.replace(/\s+/g, " ").trim();
   }
 
-  if (!summary) {
-    summary = summarizePlain(content, maxChars);
-    warnings.push("Empty summary produced; fell back to plain summarization.");
-  }
+  summary = clampText(summary, maxOut);
 
-  const inLen = String(content).length || 1;
-  const outLen = String(summary).length || 1;
+  const srcHash = sha256Hex(content);
+  const compression_ratio = content.length > 0 ? Math.max(0, content.length / Math.max(1, summary.length)) : 0;
 
   return {
     ok: true,
     result: {
       summary,
-      format,
-      compression_ratio: inLen / outLen,
-      source_hash: sha256Hex(String(content)),
-      ...(warnings.length ? { warnings } : {}),
+      format: format === "markdown" ? "markdown" : "text",
+      compression_ratio: Number.isFinite(compression_ratio) ? compression_ratio : 0,
+      source_hash: srcHash,
     },
   };
 }
 
-/* -------- convert (deterministic reference converter) -------- */
+async function handle_convert(req) {
+  const input = req?.input || {};
+  const content = String(input.content ?? "");
+  const source = (input.source_format || "").toString().toLowerCase();
+  const target = (input.target_format || "").toString().toLowerCase();
+  const maxOut = req?.limits?.max_output_tokens;
 
-function csvEscape(v) {
-  const s = String(v ?? "");
-  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-  return s;
-}
-
-function jsonToCsvString(value) {
-  // value can be object or array of objects
-  const arr = Array.isArray(value) ? value : [value];
-  const rows = arr
-    .filter((x) => x && typeof x === "object" && !Array.isArray(x))
-    .map((x) => x);
-
-  const headersSet = new Set();
-  for (const r of rows) for (const k of Object.keys(r)) headersSet.add(k);
-  const headers = Array.from(headersSet);
-
-  const lines = [];
-  lines.push(headers.map(csvEscape).join(","));
-  for (const r of rows) {
-    lines.push(headers.map((h) => csvEscape(r[h] ?? "")).join(","));
-  }
-  return lines.join("\n");
-}
-
-function parseCsv(s) {
-  // Minimal CSV parser (handles quotes)
-  const text = String(s ?? "");
-  const rows = [];
-  let row = [];
-  let cur = "";
-  let i = 0;
-  let inQuotes = false;
-
-  while (i < text.length) {
-    const ch = text[i];
-
-    if (inQuotes) {
-      if (ch === '"') {
-        if (text[i + 1] === '"') {
-          cur += '"';
-          i += 2;
-          continue;
-        }
-        inQuotes = false;
-        i += 1;
-        continue;
-      }
-      cur += ch;
-      i += 1;
-      continue;
-    }
-
-    if (ch === '"') {
-      inQuotes = true;
-      i += 1;
-      continue;
-    }
-
-    if (ch === ",") {
-      row.push(cur);
-      cur = "";
-      i += 1;
-      continue;
-    }
-
-    if (ch === "\n") {
-      row.push(cur);
-      rows.push(row);
-      row = [];
-      cur = "";
-      i += 1;
-      continue;
-    }
-
-    if (ch === "\r") {
-      i += 1;
-      continue;
-    }
-
-    cur += ch;
-    i += 1;
-  }
-
-  row.push(cur);
-  rows.push(row);
-
-  // Trim trailing empty last row if file ends with newline
-  if (rows.length && rows[rows.length - 1].length === 1 && rows[rows.length - 1][0] === "") rows.pop();
-
-  return rows;
-}
-
-function csvToJsonString(csvText) {
-  const rows = parseCsv(csvText);
-  if (!rows.length) return "[]";
-  const headers = rows[0].map((h) => String(h ?? "").trim());
-  const out = [];
-
-  for (const r of rows.slice(1)) {
-    const obj = {};
-    for (let i = 0; i < headers.length; i++) {
-      const key = headers[i] || `col_${i + 1}`;
-      obj[key] = r[i] ?? "";
-    }
-    out.push(obj);
-  }
-  return JSON.stringify(out, null, 2);
-}
-
-function htmlToTextLoose(html) {
-  // Very lossy: strip tags, preserve basic breaks
-  let s = String(html ?? "");
-  s = s.replace(/<\s*br\s*\/?\s*>/gi, "\n");
-  s = s.replace(/<\/\s*p\s*>/gi, "\n\n");
-  s = s.replace(/<[^>]+>/g, "");
-  s = s.replace(/&nbsp;/g, " ");
-  s = s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
-  return s.trim();
-}
-
-function textToHtmlLoose(text) {
-  const s = String(text ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-  return `<pre>${s}</pre>`;
-}
-
-async function handle_convert(request) {
-  const content = request?.input?.content ?? "";
-  const source_format = String(request?.input?.source_format ?? "").toLowerCase().trim();
-  const target_format = String(request?.input?.target_format ?? "").toLowerCase().trim();
-  const options = request?.input?.options ?? {};
-
+  let converted = "";
   const warnings = [];
   let lossy = false;
-  let converted = String(content);
 
-  const pair = `${source_format}->${target_format}`;
-
-  try {
-    if (pair === "json->csv") {
-      const obj = JSON.parse(String(content));
-      converted = jsonToCsvString(obj);
-      lossy = true; // csv loses types/nesting
-      warnings.push("JSON->CSV is lossy (types/nesting may be flattened).");
-    } else if (pair === "csv->json") {
-      converted = csvToJsonString(String(content));
-      lossy = false;
-    } else if (pair === "json->text" || pair === "json->plain") {
-      const obj = JSON.parse(String(content));
-      converted = JSON.stringify(obj, null, 2);
-      lossy = false;
-    } else if (pair === "text->json" || pair === "plain->json") {
-      // best-effort: must be valid JSON
-      const obj = JSON.parse(String(content));
-      converted = JSON.stringify(obj, null, 2);
-      lossy = false;
-    } else if (pair === "html->markdown") {
-      // super minimal “markdown”: really just text
-      converted = htmlToTextLoose(content);
-      lossy = true;
-      warnings.push("HTML->Markdown is implemented as lossy text extraction (no rich structure).");
-    } else if (pair === "markdown->html") {
-      converted = textToHtmlLoose(content);
-      lossy = true;
-      warnings.push("Markdown->HTML is implemented as <pre> passthrough (lossy).");
-    } else if (pair === `${source_format}->${source_format}`) {
-      converted = String(content);
-      lossy = false;
-    } else {
-      // Keep schema-green: passthrough with warnings
-      converted = String(content);
-      lossy = false;
-      warnings.push(`Unsupported conversion '${pair}'; returning passthrough content.`);
-      if (options && typeof options === "object" && Object.keys(options).length) {
-        warnings.push("Options were provided but not applied for unsupported conversion.");
+  // Minimal deterministic conversions:
+  if (source === "json" && target === "csv") {
+    lossy = true;
+    warnings.push("JSON->CSV is lossy (types/nesting may be flattened).");
+    try {
+      const obj = JSON.parse(content);
+      if (Array.isArray(obj)) {
+        // array of objects -> csv
+        const keys = Array.from(new Set(obj.flatMap((o) => (o && typeof o === "object" ? Object.keys(o) : []))));
+        const rows = [keys.join(",")].concat(
+          obj.map((o) => keys.map((k) => (o && o[k] != null ? String(o[k]) : "")).join(","))
+        );
+        converted = rows.join("\n");
+      } else if (obj && typeof obj === "object") {
+        // object -> key,value csv
+        const rows = ["key,value"].concat(Object.entries(obj).map(([k, v]) => `${k},${String(v)}`));
+        converted = rows.join("\n");
+      } else {
+        converted = "value\n" + String(obj);
       }
+    } catch {
+      converted = content;
+      lossy = true;
+      warnings.push("invalid_json_input");
     }
-  } catch (e) {
-    // Keep schema-green: passthrough with warning
-    converted = String(content);
-    lossy = false;
-    warnings.push(`Conversion error for '${pair}': ${String(e?.message ?? e)} (passthrough returned).`);
+  } else if (source === "markdown" && target === "text") {
+    lossy = true;
+    warnings.push("markdown->text strips formatting.");
+    converted = content.replace(/[#*_`>\[\]()!-]/g, "").replace(/\s+/g, " ").trim();
+  } else if (source === "html" && target === "text") {
+    lossy = true;
+    warnings.push("html->text strips tags.");
+    converted = content.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  } else {
+    // identity fallback
+    converted = content;
+    warnings.push("no_conversion_rule_applied; returned input as-is");
   }
+
+  converted = clampText(converted, maxOut);
 
   return {
     ok: true,
     result: {
-      converted_content: converted.length ? converted : " ", // must satisfy minLength 1
-      source_format: source_format || "unknown",
-      target_format: target_format || "unknown",
+      converted_content: converted,
+      source_format: source || "unknown",
+      target_format: target || "unknown",
       lossy,
       ...(warnings.length ? { warnings } : {}),
     },
   };
 }
 
-/* -------------------- handlers registry -------------------- */
+async function handle_explain(req) {
+  const input = req?.input || {};
+  const subject = String(input.subject || "").trim();
+  const context = input.context ? String(input.context).trim() : "";
+  const audience = input.audience ? String(input.audience).trim() : "general";
+  const detail = input.detail_level || "medium";
+  const style = input.style ? String(input.style).trim().toLowerCase() : "";
+  const maxOut = req?.limits?.max_output_tokens;
 
+  let explanation = "";
+  if (detail === "short") {
+    explanation =
+      `**${subject}** explained for **${audience}**: ` +
+      `This runtime returns a deterministic explanation based on the request fields and known protocol semantics.`;
+  } else if (detail === "long") {
+    explanation =
+      `**${subject}** explained for **${audience}**:\n\n` +
+      `This is a deterministic reference explanation produced by a CommandLayer runtime (non-LLM). ` +
+      `It is designed to be schema-valid and receipt-verifiable, not to simulate deep reasoning.\n\n` +
+      `What it does:\n` +
+      `- Reads your subject (and optional context)\n` +
+      `- Applies audience/style/detail hints\n` +
+      `- Returns a verifiable receipt (schema + hash + signature)\n\n` +
+      `Why that matters:\n` +
+      `- Interoperability: meaning is stable across runtimes\n` +
+      `- Auditability: receipts are evidence, not logs\n` +
+      `- Replaceability: execution can change without breaking semantics`;
+  } else {
+    explanation =
+      `**${subject}** explained for **${audience}**: ` +
+      `This runtime produces a structured explanation using your request hints ` +
+      `and returns it as a verifiable receipt.`;
+  }
+
+  if (context) explanation += `\n\nContext provided:\n${clampText(context, 800)}`;
+
+  const wantsSteps =
+    style.includes("step") ||
+    style.includes("steps") ||
+    style.includes("walk") ||
+    detail === "long";
+
+  const steps = wantsSteps
+    ? [
+        `Identify the subject: "${subject}".`,
+        `Apply audience hint: "${audience}".`,
+        `Apply style hint: "${style || "none"}" and detail level: "${detail}".`,
+        `Generate a deterministic explanation (non-LLM).`,
+        `Emit a receipt with hash + signature for independent verification.`,
+      ]
+    : null;
+
+  const summary = detail !== "short"
+    ? `Deterministic explanation for "${subject}" (audience: ${audience}, detail: ${detail}).`
+    : null;
+
+  const references = [
+    req?.x402?.entry ? String(req.x402.entry) : null,
+    "https://commandlayer.org/schemas/v1.0.0/commons/explain/requests/explain.request.schema.json",
+    "https://commandlayer.org/schemas/v1.0.0/commons/explain/receipts/explain.receipt.schema.json",
+  ].filter(Boolean);
+
+  return {
+    ok: true,
+    result: {
+      explanation: clampText(explanation, maxOut),
+      ...(steps ? { steps } : {}),
+      ...(summary ? { summary: clampText(summary, Math.min(Number(maxOut || 300), 300)) } : {}),
+      ...(references.length ? { references } : {}),
+    },
+  };
+}
+
+// -------------------------
+// handler registry
+// -------------------------
 const HANDLERS = {
-  fetch: (req) => handle_fetch(req),
-  describe: (req) => handle_describe(req),
-  format: (req) => handle_format(req),
-  clean: (req) => handle_clean(req),
-  parse: (req) => handle_parse(req),
-  summarize: (req) => handle_summarize(req),
-  convert: (req) => handle_convert(req),
+  fetch: handle_fetch,
+  describe: handle_describe,
+  format: handle_format,
+  clean: handle_clean,
+  parse: handle_parse,
+  summarize: handle_summarize,
+  convert: handle_convert,
+  explain: handle_explain,
 };
 
-/* -------------------- runtime route (multi-verb) -------------------- */
+// -------------------------
+// express app
+// -------------------------
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "2mb" }));
 
-app.post("/:verb/v1.0.0", async (req, res) => {
-  const verb = String(req.params.verb || "").trim();
+app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-  if (!verb || !ENABLED_VERBS.includes(verb)) {
-    return res.status(404).json({ error: "unknown verb", verb });
+app.get("/debug/env", async (_req, res) => {
+  const { privPem, pubPem } = getEnvSignerKeys();
+  res.json({
+    ok: true,
+    node: process.version,
+    cwd: process.cwd(),
+    port: PORT,
+    service: process.env.RAILWAY_SERVICE_NAME || process.env.SERVICE_NAME || "commandlayer-runtime",
+    ens_name: ENS_NAME,
+    verifier_ens_name: VERIFIER_ENS_NAME,
+    schema_ens_template: SCHEMA_ENS_TEMPLATE,
+    has_rpc: !!publicClient,
+    enabled_verbs: ENABLED_VERBS,
+    signer_id: RECEIPT_SIGNER_ID,
+    signer_ok: !!privPem && !!(pubPem || PUB_PEM_B64),
+    signer_error: !privPem ? "missing RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64" : (!PUB_PEM_B64 ? "missing RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64" : null),
+    has_priv_b64: !!PRIV_PEM_B64,
+    has_pub_b64: !!PUB_PEM_B64,
+    pub_env_preview: pubPem ? envPreviewPem(pubPem) : null,
+    ens_verifier_cache: {
+      has_key: verifierKeyCache.has_key,
+      cached_at: verifierKeyCache.cached_at,
+      expires_at: verifierKeyCache.expires_at,
+      last_error: verifierKeyCache.last_error,
+    },
+  });
+});
+
+app.get("/debug/enskey", async (req, res) => {
+  const refresh = String(req.query.refresh || "") === "1";
+  const k = await ensureVerifierEnsKey({ refresh });
+  if (!k.has_key) {
+    return res.json({ ok: false, error: k.last_error || "No ENS verifier key" });
+  }
+  res.json({
+    ok: true,
+    ens: VERIFIER_ENS_NAME,
+    alg: k.alg,
+    signer_id: k.signer_id,
+    pubkey_source: k.pubkey_source,
+    pubkey_preview: envPreviewPem(k.pubkey_pem),
+    cached_at: k.cached_at,
+    expires_at: k.expires_at,
+  });
+});
+
+app.get("/debug/verbs", async (req, res) => {
+  const refresh = String(req.query.refresh || "") === "1";
+  const verbs = {};
+  for (const v of ENABLED_VERBS) {
+    verbs[v] = await ensureVerbSchemas(v, { refresh });
+    // don't leak compiled validators in debug output
+    if (verbs[v]?.vReq) verbs[v].vReq = undefined;
+    if (verbs[v]?.vRcpt) verbs[v].vRcpt = undefined;
+  }
+  res.json({ ok: true, verbs });
+});
+
+// POST /verify (receipt in body) ; /verify?ens=1 uses VERIFIER_ENS_NAME key
+app.post("/verify", async (req, res) => {
+  const ens = String(req.query.ens || "") === "1";
+  const refresh = String(req.query.refresh || "") === "1";
+  const result = await verifyReceipt(req.body, { ens, refresh });
+  res.json(result);
+});
+
+// generic verb route: POST /<verb>/v1.0.0
+app.post("/:verb/v:version", async (req, res) => {
+  const verb = String(req.params.verb || "").toLowerCase();
+  const version = String(req.params.version || "");
+
+  if (!ENABLED_VERBS.includes(verb)) {
+    return res.status(404).json({ error: "verb not enabled", verb });
   }
 
-  const t0 = Date.now();
-
-  // Load validators for this verb
-  const schemas = await getVerbSchemas(verb);
-  if (!schemas.ok || !schemas.vReq || !schemas.vRcpt) {
-    return res.status(503).json({ error: "schemas not ready", verb, schema: schemas });
+  // ensure schemas (from ENS) are ready
+  const schemas = await ensureVerbSchemas(verb, { refresh: String(req.query.refresh || "") === "1" });
+  if (!schemas.ok) {
+    return res.status(503).json({
+      error: "schemas not ready",
+      verb,
+      schema: {
+        mode: schemas.mode,
+        ok: schemas.ok,
+        ens: schemas.ens,
+        reqUrl: schemas.reqUrl,
+        rcptUrl: schemas.rcptUrl,
+        error: schemas.error,
+        cached_at: schemas.cached_at,
+        expires_at: schemas.expires_at,
+      },
+    });
   }
 
-  // Validate request
-  const request = req.body;
-  if (!schemas.vReq(request)) {
-    return res.status(400).json({ error: "request schema invalid", verb, details: schemas.vReq.errors });
+  // validate request schema
+  const body = req.body;
+  const okReq = schemas.vReq(body);
+  if (!okReq) {
+    return res.status(400).json({
+      error: "request schema invalid",
+      verb,
+      details: schemas.vReq.errors || null,
+    });
   }
 
-  // Execute via handler
-  const started_at = new Date().toISOString();
-  const trace_id = id("trace");
-  const handler = HANDLERS[verb];
+  // basic route/version guard (schema should already enforce, but keep it explicit)
+  if (body?.x402?.verb !== verb || body?.x402?.version !== version) {
+    return res.status(400).json({
+      error: "x402 mismatch",
+      expected: { verb, version },
+      got: { verb: body?.x402?.verb, version: body?.x402?.version },
+    });
+  }
+
+  const started = Date.now();
+  const trace = {
+    trace_id: rndId("trace"),
+    started_at: nowIso(),
+    completed_at: null,
+    duration_ms: null,
+    provider: process.env.RAILWAY_SERVICE_NAME || "commandlayer-runtime",
+  };
 
   try {
-    if (!handler) {
-      return res.status(500).json({ error: "no_handler", verb });
+    const handler = HANDLERS[verb];
+    if (!handler) return res.status(500).json({ error: "handler missing", verb });
+
+    // timeouts: best-effort — if timeout_ms exists, we race the handler
+    const timeoutMs = Number(body?.limits?.timeout_ms || body?.limits?.max_latency_ms || 0) || 0;
+
+    let handled;
+    if (timeoutMs > 0) {
+      handled = await Promise.race([
+        handler(body),
+        (async () => {
+          await sleep(timeoutMs);
+          return { ok: false, error: "timeout" };
+        })(),
+      ]);
+      if (!handled?.ok) throw new Error(handled?.error || "timeout");
+    } else {
+      handled = await handler(body);
+      if (!handled?.ok) throw new Error(handled?.error || "handler error");
     }
 
-    const exec = await handler(request);
+    trace.completed_at = nowIso();
+    trace.duration_ms = Date.now() - started;
 
-    const base = {
-      x402: request.x402,
-      trace: {
-        trace_id,
-        started_at,
-        completed_at: new Date().toISOString(),
-        duration_ms: Date.now() - t0,
-        provider: SERVICE_NAME,
-      },
-    };
+    const entry = body?.x402?.entry || `x402://${verbEnsName(verb)}/${verb}/v${version}`;
+    const receipt = buildReceipt({
+      verb,
+      version,
+      entry,
+      trace,
+      result: handled.result,
+      request: body,
+    });
 
-    // IMPORTANT: our commons verbs are implemented to always return ok:true
-    // to keep receipt schemas (which require result) schema-green.
-    let receipt = {
-      status: "success",
-      ...base,
-      result: exec?.result ?? {},
-      ...(exec?.usage ? { usage: exec.usage } : {}),
-    };
-
-    attachReceiptProofOrThrow(receipt);
-
-    // Validate receipt against verb receipt schema
-    if (!schemas.vRcpt(receipt)) {
+    // validate receipt schema before returning (hard guarantee)
+    const okRcpt = schemas.vRcpt(receipt);
+    if (!okRcpt) {
       return res.status(500).json({
-        error: "receipt schema invalid",
+        error: "internal: generated receipt failed schema",
         verb,
-        details: schemas.vRcpt.errors,
-        note: "Handler output does not match this verb’s receipt schema. Fix handler to match schema.",
+        details: schemas.vRcpt.errors || null,
       });
     }
 
     return res.json(receipt);
   } catch (e) {
-    const msg = String(e?.message ?? e);
+    trace.completed_at = nowIso();
+    trace.duration_ms = Date.now() - started;
     return res.status(500).json({
-      error: "runtime_error",
+      error: String(e?.message || e),
       verb,
-      message: msg,
-      hint: msg.includes("Missing RECEIPT_") ? "Signing key misconfigured (check *_PEM_B64 vars)." : null,
+      trace,
     });
   }
 });
 
-/* -------------------- start -------------------- */
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`listening on ${PORT}`);
+app.listen(PORT, () => {
+  console.log(`[runtime] listening on :${PORT}`);
 });
