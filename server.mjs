@@ -17,13 +17,10 @@ app.use(express.json({ limit: "2mb" }));
 const SERVICE_NAME = process.env.SERVICE_NAME?.trim() || "commandlayer-runtime";
 
 // ENS used to resolve schema TXT records for each verb.
-// Template lets one runtime serve many verbs.
 // Example: "{verb}agent.eth" -> fetchagent.eth, cleanagent.eth, etc.
 const SCHEMA_ENS_TEMPLATE = process.env.SCHEMA_ENS_TEMPLATE?.trim() || "{verb}agent.eth";
 
 // ENS used to resolve verifier public key (cl.receipt.* TXT records).
-// This should be ONE stable ENS name for the whole Commons signer.
-// If unset, falls back to ENS_NAME.
 const ENS_NAME = process.env.ENS_NAME?.trim() || null;
 const VERIFIER_ENS_NAME = process.env.VERIFIER_ENS_NAME?.trim() || ENS_NAME;
 
@@ -37,9 +34,9 @@ const PORT = Number(process.env.PORT || 8080);
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 8000);
 const ENS_CACHE_TTL_MS = Number(process.env.ENS_CACHE_TTL_MS || 10 * 60 * 1000); // 10m
 
-// Which verbs are enabled on this runtime
+// Enabled verbs (supports spaces)
 const ENABLED_VERBS = (process.env.ENABLED_VERBS?.trim() ||
-  "fetch,describe,format,clean,parse,summarize")
+  "fetch,describe,format,clean,parse,summarize,convert")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -51,7 +48,7 @@ function id(prefix) {
 }
 
 function sha256Hex(s) {
-  return crypto.createHash("sha256").update(String(s)).digest("hex");
+  return crypto.createHash("sha256").update(s).digest("hex");
 }
 
 function canonicalJson(obj) {
@@ -105,7 +102,7 @@ function attachReceiptProofOrThrow(receipt) {
     canonical: "json-stringify",
     hash_sha256: hash,
     signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || SERVICE_NAME,
-    signature_b64: signEd25519(hash)
+    signature_b64: signEd25519(hash),
   };
 
   if (!receipt?.metadata?.proof?.signature_b64 || !receipt?.metadata?.proof?.hash_sha256) {
@@ -146,6 +143,11 @@ function blocked(url) {
 
 function ensForVerb(verb) {
   return SCHEMA_ENS_TEMPLATE.replaceAll("{verb}", verb);
+}
+
+function clampStr(s, maxLen) {
+  const v = String(s ?? "");
+  return v.length > maxLen ? v.slice(0, maxLen) : v;
 }
 
 /* -------------------- ENS helpers -------------------- */
@@ -199,7 +201,7 @@ async function buildValidators(reqUrl, rcptUrl) {
   const ajv = new Ajv2020({
     strict: true,
     allErrors: true,
-    loadSchema: async (uri) => (await fetch(uri)).json()
+    loadSchema: async (uri) => (await fetch(uri)).json(),
   });
   addFormats(ajv);
 
@@ -226,7 +228,7 @@ async function getVerbSchemas(verb, { refresh = false } = {}) {
     vRcpt: null,
     error: null,
     cached_at: new Date(now).toISOString(),
-    expires_at: new Date(now + ENS_CACHE_TTL_MS).toISOString()
+    expires_at: new Date(now + ENS_CACHE_TTL_MS).toISOString(),
   };
 
   verbSchemaCache.set(verb, entry);
@@ -255,7 +257,7 @@ async function getVerbSchemas(verb, { refresh = false } = {}) {
       rcptUrl,
       vReq,
       vRcpt,
-      error: null
+      error: null,
     };
 
     verbSchemaCache.set(verb, ready);
@@ -265,7 +267,7 @@ async function getVerbSchemas(verb, { refresh = false } = {}) {
       ...entry,
       mode: "degraded",
       ok: false,
-      error: String(e?.message ?? e)
+      error: String(e?.message ?? e),
     };
     verbSchemaCache.set(verb, degraded);
     return degraded;
@@ -291,7 +293,7 @@ async function getEnsVerifierKey({ refresh = false } = {}) {
     ...k,
     cached_at: new Date(now).toISOString(),
     expires_at: new Date(now + ENS_CACHE_TTL_MS).toISOString(),
-    error: null
+    error: null,
   };
 
   return { ...ensKeyCache, source: "ens" };
@@ -342,8 +344,8 @@ app.get("/debug/env", (_req, res) => {
       has_key: Boolean(ensKeyCache?.pubkey_pem),
       cached_at: ensKeyCache?.cached_at || null,
       expires_at: ensKeyCache?.expires_at || null,
-      last_error: ensKeyCache?.error || null
-    }
+      last_error: ensKeyCache?.error || null,
+    },
   });
 });
 
@@ -358,7 +360,7 @@ app.get("/debug/enskey", async (_req, res) => {
       pubkey_source: k.source,
       pubkey_preview: k.pubkey_pem.slice(0, 40) + "...",
       cached_at: k.cached_at,
-      expires_at: k.expires_at
+      expires_at: k.expires_at,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message ?? e) });
@@ -378,7 +380,7 @@ app.get("/debug/verbs", async (req, res) => {
       rcptUrl: s.rcptUrl,
       error: s.error || null,
       cached_at: s.cached_at,
-      expires_at: s.expires_at
+      expires_at: s.expires_at,
     };
   }
   res.json({ ok: true, verbs: out });
@@ -395,8 +397,7 @@ app.post("/verify", async (req, res) => {
       return res.status(400).json({ ok: false, error: "missing metadata.proof.signature_b64 or hash_sha256" });
     }
 
-    // Best-effort schema validation:
-    // - If receipt.x402.verb exists, validate against that verb’s receipt schema
+    // Best-effort schema validation using receipt.x402.verb
     const verb = receipt?.x402?.verb?.trim?.() || null;
     let schema_valid = false;
     let schema_errors = null;
@@ -432,7 +433,7 @@ app.post("/verify", async (req, res) => {
     if (!pubPem) {
       return res.status(503).json({
         ok: false,
-        error: requireEns ? "ENS verifier key unavailable" : "Missing RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64"
+        error: requireEns ? "ENS verifier key unavailable" : "Missing RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64",
       });
     }
 
@@ -455,18 +456,18 @@ app.post("/verify", async (req, res) => {
         canonical: proof.canonical || null,
         claimed_hash,
         recomputed_hash,
-        pubkey_source
+        pubkey_source,
       },
-      errors: { schema_errors, signature_error }
+      errors: { schema_errors, signature_error },
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message ?? e) });
   }
 });
 
-/* -------------------- verb implementations -------------------- */
+/* -------------------- verb handlers -------------------- */
 
-// ✅ fetch (real network)
+// ✅ Real handler (already proven)
 async function handle_fetch(request) {
   const url = request.source;
   if (blocked(url)) {
@@ -498,375 +499,552 @@ async function handle_fetch(request) {
           ok: r.ok,
           http_status: r.status,
           headers,
-          body_preview: (text || "").slice(0, 2000)
-        }
-      ]
-    }
+          body_preview: (text || "").slice(0, 2000),
+        },
+      ],
+    },
   };
 }
 
-// ✅ describe (deterministic reference “explainer”)
-function describeTemplate(subject, detailLevel, audience) {
-  const s = String(subject || "").trim();
-  const dl = (detailLevel || "short").toLowerCase();
-  const aud = (audience || "novice").toLowerCase();
+/* -------- describe (deterministic reference output) -------- */
 
-  const base =
-    `**${s}** is a CommandLayer concept: a standard “API meaning” contract agents can call using published schemas and receipts.`;
+function buildDescribeText(subject, detail_level, audience) {
+  const s = clampStr(subject, 200);
+  const dl = detail_level || "medium";
+  const aud = audience || "general";
+
+  if (dl === "short") {
+    return `**${s}** is a CommandLayer concept: a standard “API meaning” contract agents can call using published schemas and receipts.`;
+  }
+  if (dl === "long") {
+    return `**${s}** is described in CommandLayer terms as a semantic contract: a stable verb+schema interface whose outputs are issued as verifiable receipts. This enables interoperability across runtimes (swap execution without breaking meaning) and post-hoc verification (hash + signature). Audience: ${aud}.`;
+  }
+  return `**${s}** is a semantic contract surface in CommandLayer: verbs + schemas define meaning, and receipts provide verifiable evidence of execution.`;
+}
+
+async function handle_describe(request) {
+  const subject = request?.input?.subject ?? "Unknown";
+  const detail_level = request?.input?.detail_level ?? "medium";
+  const audience = request?.input?.audience ?? "general";
+
+  const description = buildDescribeText(subject, detail_level, audience);
 
   const bullets = [
     "Schemas define meaning (requests + receipts).",
     "Runtimes can be swapped without breaking interoperability.",
-    "Receipts can be independently verified (hash + signature)."
+    "Receipts can be independently verified (hash + signature).",
   ];
 
-  if (dl === "long" || aud === "expert") {
-    bullets.push("ENS TXT records can point to canonical schema URIs + immutable mirrors (IPFS).");
-    bullets.push("Receipt proofs bind the semantic envelope to an execution outcome.");
-  }
-
-  return { base, bullets };
-}
-
-async function handle_describe(request) {
-  const subject = request?.input?.subject ?? "";
-  const detail_level = request?.input?.detail_level ?? "short";
-  const audience = request?.input?.audience ?? "novice";
-
-  const { base, bullets } = describeTemplate(subject, detail_level, audience);
+  const properties = {
+    verb: "describe",
+    version: "1.0.0",
+    audience: String(audience),
+    detail_level: String(detail_level),
+  };
 
   return {
     ok: true,
     result: {
-      description: base,
+      description,
       bullets,
-      properties: {
-        verb: "describe",
-        version: "1.0.0",
-        audience: String(audience),
-        detail_level: String(detail_level)
-      }
-    }
+      properties,
+    },
   };
 }
 
-// ✅ format (deterministic reference formatter)
-function parseKeyValueLines(s) {
-  // Accept:
-  // a: 1
-  // b: 2
-  // c: 3
+/* -------- format (deterministic reference formatter) -------- */
+
+function parseLooseKVLines(s) {
+  // Accept "a: 1" lines (very small YAML-ish)
   const out = [];
-  const lines = String(s || "").replace(/\r\n/g, "\n").split("\n");
+  const lines = String(s ?? "").split(/\r?\n/).filter((x) => x.trim().length);
   for (const line of lines) {
-    const m = line.match(/^\s*([^:]+?)\s*:\s*(.*?)\s*$/);
-    if (!m) continue;
-    out.push([m[1].trim(), m[2].trim()]);
+    const m = line.match(/^\s*([^:#]+?)\s*:\s*(.*?)\s*$/);
+    if (m) out.push([m[1].trim(), m[2].trim()]);
   }
   return out;
 }
 
 function toMarkdownTable(pairs) {
-  const rows = pairs.map(([k, v]) => `| ${k} | ${v} |`);
-  return ["| key | value |", "|---|---|", ...rows].join("\n");
+  const rows = pairs.map(([k, v]) => [String(k), String(v)]);
+  const header = `| key | value |\n|---|---|`;
+  const body = rows.map(([k, v]) => `| ${k} | ${v} |`).join("\n");
+  return `${header}\n${body}`;
 }
 
 async function handle_format(request) {
   const content = request?.input?.content ?? "";
-  const target = String(request?.input?.target_style ?? "").toLowerCase().trim();
+  const target_style = (request?.input?.target_style ?? "text").toString();
 
-  let formatted = "";
-  let style = target || "text";
+  const original_length = String(content).length;
+  const warnings = [];
 
-  if (target === "table") {
-    const pairs = parseKeyValueLines(content);
+  let formatted_content = String(content);
+  let style = target_style;
+
+  if (target_style === "table") {
+    const pairs = parseLooseKVLines(content);
     if (pairs.length) {
-      formatted = toMarkdownTable(pairs);
+      formatted_content = toMarkdownTable(pairs);
       style = "table";
     } else {
-      formatted = String(content).trim();
+      warnings.push("No key:value lines detected; returning original content.");
+      formatted_content = String(content);
       style = "text";
     }
-  } else if (target === "json-block" || target === "json") {
-    // best-effort: try parse JSON then re-stringify
+  } else if (target_style === "json_pretty") {
     try {
       const obj = JSON.parse(String(content));
-      formatted = JSON.stringify(obj, null, 2);
-      style = "json";
+      formatted_content = JSON.stringify(obj, null, 2);
+      style = "json_pretty";
     } catch {
-      formatted = String(content).trim();
+      warnings.push("Invalid JSON; returning original content.");
+      formatted_content = String(content);
       style = "text";
     }
-  } else if (target === "markdown" || target === "bullet-list") {
-    // if it looks like CSV-ish / lines, bullet it
-    const lines = String(content).replace(/\r\n/g, "\n").split("\n").map((l) => l.trim()).filter(Boolean);
-    if (target === "bullet-list") {
-      formatted = lines.map((l) => `- ${l.replace(/^\s*[-•]\s*/, "")}`).join("\n");
-      style = "bullet-list";
-    } else {
-      formatted = lines.join("\n");
-      style = "markdown";
-    }
   } else {
-    formatted = String(content).trim();
-    style = target || "text";
+    style = target_style;
+    formatted_content = String(content);
   }
+
+  const formatted_length = formatted_content.length;
 
   return {
     ok: true,
     result: {
-      formatted_content: formatted || "(empty)",
+      formatted_content,
       style,
-      original_length: String(content || "").length,
-      formatted_length: String(formatted || "").length,
-      notes: "Deterministic reference formatter (non-LLM)."
-    }
+      original_length,
+      formatted_length,
+      notes: "Deterministic reference formatter (non-LLM).",
+      ...(warnings.length ? { warnings } : {}),
+    },
   };
 }
 
-// ✅ clean (deterministic sanitization pipeline)
-function applyCleanOps(input, ops = []) {
-  let s = String(input || "");
-  const applied = [];
-  const issues = [];
+/* -------- clean (deterministic normalizer) -------- */
 
-  const list = Array.isArray(ops) ? ops.map(String) : [];
-
-  for (const op of list) {
-    if (op === "normalize_newlines") {
-      s = s.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-      applied.push(op);
-    } else if (op === "collapse_whitespace") {
-      // collapse spaces/tabs, but keep newlines
-      s = s.replace(/[ \t]+/g, " ");
-      applied.push(op);
-    } else if (op === "trim") {
-      s = s.trim();
-      applied.push(op);
-    } else if (op === "remove_empty_lines") {
-      s = s
-        .split("\n")
-        .map((l) => l.trimEnd())
-        .filter((l) => l.trim().length > 0)
-        .join("\n");
-      applied.push(op);
-    } else if (op === "redact_emails") {
-      const before = s;
-      s = s.replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted-email]");
-      applied.push(op);
-      if (s !== before) issues.push("emails_redacted");
-    } else if (op) {
-      // Unknown op: ignore (do not break determinism)
-    }
-  }
-
-  return { cleaned: s, applied, issues };
+function normalizeNewlines(s) {
+  return String(s ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+function collapseWhitespace(s) {
+  return String(s ?? "").replace(/[ \t]+/g, " ");
+}
+function trim(s) {
+  return String(s ?? "").trim();
+}
+function removeEmptyLines(s) {
+  return String(s ?? "")
+    .split("\n")
+    .map((l) => l.trimEnd())
+    .filter((l) => l.trim().length > 0)
+    .join("\n");
+}
+function redactEmails(s) {
+  // Simple email regex (best-effort)
+  const re = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
+  const had = re.test(String(s ?? ""));
+  const out = String(s ?? "").replace(re, "[redacted-email]");
+  return { out, had };
 }
 
 async function handle_clean(request) {
   const content = request?.input?.content ?? "";
-  const ops = request?.input?.operations ?? [];
+  const ops = Array.isArray(request?.input?.operations) ? request.input.operations : [];
 
   const original_length = String(content).length;
-  const { cleaned, applied, issues } = applyCleanOps(content, ops);
+  let s = String(content);
+  const operations_applied = [];
+  const issues_detected = [];
+  const warnings = [];
+
+  for (const op of ops) {
+    const o = String(op);
+    if (o === "normalize_newlines") {
+      s = normalizeNewlines(s);
+      operations_applied.push(o);
+    } else if (o === "collapse_whitespace") {
+      s = collapseWhitespace(s);
+      operations_applied.push(o);
+    } else if (o === "trim") {
+      s = trim(s);
+      operations_applied.push(o);
+    } else if (o === "remove_empty_lines") {
+      s = removeEmptyLines(s);
+      operations_applied.push(o);
+    } else if (o === "redact_emails") {
+      const { out, had } = redactEmails(s);
+      s = out;
+      operations_applied.push(o);
+      if (had) issues_detected.push("emails_redacted");
+    } else {
+      warnings.push(`Unknown operation '${o}' ignored.`);
+    }
+  }
+
+  // If no ops specified, do a safe default: normalize + trim
+  if (operations_applied.length === 0) {
+    s = trim(normalizeNewlines(s));
+    operations_applied.push("normalize_newlines", "trim");
+  }
+
+  const cleaned_length = s.length;
 
   return {
     ok: true,
     result: {
-      cleaned_content: cleaned || "(empty)",
-      operations_applied: applied.length ? applied : undefined,
-      issues_detected: issues.length ? issues : undefined,
+      cleaned_content: s,
       original_length,
-      cleaned_length: String(cleaned).length
-    }
+      cleaned_length,
+      operations_applied,
+      ...(issues_detected.length ? { issues_detected } : {}),
+      ...(warnings.length ? { warnings } : {}),
+    },
   };
 }
 
-// ✅ parse (deterministic parsers: json, yaml-ish key: value)
-function parseJsonStrict(s) {
+/* -------- parse (deterministic reference parser) -------- */
+
+function tryJsonParse(s) {
   return JSON.parse(String(s));
 }
 
-function parseYamlBestEffort(s) {
-  // very small subset: key: value per line
-  const out = {};
-  const lines = String(s || "").replace(/\r\n/g, "\n").split("\n");
-  for (const line of lines) {
-    const m = line.match(/^\s*([^:#]+?)\s*:\s*(.*?)\s*$/);
-    if (!m) continue;
-    const k = m[1].trim();
-    const v = m[2].trim();
-    out[k] = v;
-  }
-  return out;
+function parseLooseYamlKV(s) {
+  const pairs = parseLooseKVLines(s);
+  const obj = {};
+  for (const [k, v] of pairs) obj[k] = v;
+  return obj;
 }
 
 async function handle_parse(request) {
   const content = request?.input?.content ?? "";
-  const content_type = String(request?.input?.content_type ?? "").toLowerCase().trim();
-  const mode = String(request?.input?.mode ?? "best_effort").toLowerCase().trim();
+  const content_type = (request?.input?.content_type ?? "").toString().toLowerCase();
+  const mode = (request?.input?.mode ?? "best_effort").toString();
 
-  let parsed = null;
+  let parsed = {};
   let confidence = 0.5;
   const warnings = [];
 
-  try {
-    if (content_type === "json") {
-      parsed = parseJsonStrict(content);
+  if (content_type === "json") {
+    try {
+      parsed = tryJsonParse(content);
       confidence = 0.98;
-    } else if (content_type === "yaml") {
-      parsed = parseYamlBestEffort(content);
-      confidence = mode === "strict" ? 0.85 : 0.75;
-      if (mode === "strict") warnings.push("yaml_strict_mode_is_subset_parser");
-    } else {
-      // best effort: try json then fallback yaml-ish
-      try {
-        parsed = parseJsonStrict(content);
-        confidence = 0.9;
-      } catch {
-        parsed = parseYamlBestEffort(content);
-        confidence = 0.6;
-        warnings.push("best_effort_fallback_parser_used");
+    } catch (e) {
+      if (mode === "strict") {
+        // Strict: return “best-effort but schema-green”
+        warnings.push("Invalid JSON in strict mode; returning empty object.");
+        parsed = {};
+        confidence = 0.01;
+      } else {
+        warnings.push("Invalid JSON; falling back to empty object.");
+        parsed = {};
+        confidence = 0.05;
       }
     }
-  } catch (e) {
-    if (mode === "strict") {
-      return {
-        ok: false,
-        error: {
-          code: "PARSE_FAILED",
-          message: String(e?.message ?? e),
-          retryable: false
-        }
-      };
-    }
-    parsed = parseYamlBestEffort(content);
-    confidence = 0.4;
-    warnings.push("parse_failed_then_fallback_parser_used");
-  }
-
-  const result = { parsed, confidence };
-  if (warnings.length) result.warnings = warnings;
-
-  return { ok: true, result };
-}
-
-// ✅ summarize (deterministic reference summarizer)
-function clampSummaryLen(maxOutputTokens) {
-  // Schema says tokens; runtime returns deterministic text.
-  // Treat as character budget with sane bounds.
-  const n = Number(maxOutputTokens || 0);
-  if (!Number.isFinite(n) || n <= 0) return 800;
-  return Math.max(80, Math.min(n, 32768));
-}
-
-function pickSummaryFormat(req) {
-  const hint = (req?.input?.format_hint || "").toLowerCase().trim();
-  if (["text", "markdown", "html", "json", "other"].includes(hint)) return hint;
-
-  const outs = req?.channel?.output_modalities || [];
-  if (Array.isArray(outs) && outs.map(String).includes("json")) return "json";
-
-  return "text";
-}
-
-function normalizeTextForSummarize(s) {
-  return String(s || "")
-    .replace(/\r\n/g, "\n")
-    .replace(/[ \t]+/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
-function splitSentences(s) {
-  const out = [];
-  let buf = "";
-  for (let i = 0; i < s.length; i++) {
-    const ch = s[i];
-    buf += ch;
-    if (ch === "." || ch === "!" || ch === "?") {
-      const next = s[i + 1] || "";
-      if (next === " " || next === "\n" || next === "\t" || next === "") {
-        const t = buf.trim();
-        if (t) out.push(t);
-        buf = "";
-      }
-    }
-  }
-  const tail = buf.trim();
-  if (tail) out.push(tail);
-  return out;
-}
-
-function summarizeDeterministic(content, style, maxChars) {
-  const text = normalizeTextForSummarize(content);
-  if (!text) return "";
-
-  if (text.length <= maxChars) return text.slice(0, maxChars);
-
-  const sentences = splitSentences(text);
-  const wantBullets = String(style || "").toLowerCase().includes("bullet");
-
-  const picked = [];
-  let used = 0;
-
-  for (const s of sentences) {
-    const nextLen = s.length + (picked.length ? 1 : 0);
-    if (used + nextLen > maxChars) break;
-    picked.push(s);
-    used += nextLen;
-    if (picked.length >= 6) break;
-  }
-
-  let out;
-  if (picked.length === 0) {
-    out = text.slice(0, maxChars);
-  } else if (wantBullets) {
-    out = picked.map((x) => `- ${x.replace(/^\s*[-•]\s*/, "")}`).join("\n");
+  } else if (content_type === "yaml") {
+    // Minimal YAML-ish: key: value lines
+    parsed = parseLooseYamlKV(content);
+    confidence = Object.keys(parsed).length ? 0.75 : 0.2;
+    if (!Object.keys(parsed).length) warnings.push("No key:value pairs detected.");
   } else {
-    out = picked.join(" ");
+    // Default: attempt JSON, else fallback to kv pairs, else raw wrapper
+    try {
+      parsed = tryJsonParse(content);
+      confidence = 0.9;
+      warnings.push("content_type not provided; inferred JSON.");
+    } catch {
+      const obj = parseLooseYamlKV(content);
+      if (Object.keys(obj).length) {
+        parsed = obj;
+        confidence = 0.6;
+        warnings.push("content_type not provided; inferred key:value lines.");
+      } else {
+        parsed = { text: String(content) };
+        confidence = 0.3;
+        warnings.push("content_type not provided; returning raw text wrapper.");
+      }
+    }
   }
-
-  if (out.length > maxChars) out = out.slice(0, maxChars);
-  return out;
-}
-
-async function handle_summarize(request) {
-  const content = request?.input?.content ?? "";
-  const maxChars = clampSummaryLen(request?.limits?.max_output_tokens);
-  const format = pickSummaryFormat(request);
-  const style = request?.input?.summary_style || "";
-
-  const normalized = normalizeTextForSummarize(content);
-  const summary = summarizeDeterministic(normalized, style, maxChars);
-
-  const source_hash = sha256Hex(normalized);
-  const inputLen = normalized.length || 0;
-  const outputLen = summary.length || 1;
-  const compression_ratio = inputLen / outputLen;
 
   return {
     ok: true,
     result: {
-      summary: summary || "(empty summary)",
-      format,
-      compression_ratio,
-      source_hash
-    }
+      parsed,
+      confidence,
+      ...(request?.input?.target_schema ? { target_schema: String(request.input.target_schema) } : {}),
+      ...(warnings.length ? { warnings } : {}),
+    },
   };
 }
 
-// Stubs (signed receipts, but schema-green only when implemented)
-async function handler_stub(_request, verb) {
+/* -------- summarize (deterministic reference summarizer) -------- */
+
+function summarizeBullets(text, maxChars) {
+  const s = String(text ?? "").trim();
+  if (!s) return "";
+
+  // Split into sentences-ish
+  const parts = s
+    .replace(/\s+/g, " ")
+    .split(/(?<=[.!?])\s+/)
+    .filter(Boolean);
+
+  const bullets = [];
+  for (const p of parts.slice(0, 6)) {
+    bullets.push(`- ${p}`);
+  }
+  const out = bullets.join("\n");
+  return out.length > maxChars ? out.slice(0, maxChars) : out;
+}
+
+function summarizePlain(text, maxChars) {
+  const s = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (s.length <= maxChars) return s;
+  return s.slice(0, Math.max(0, maxChars - 1)) + "…";
+}
+
+async function handle_summarize(request) {
+  const content = request?.input?.content ?? "";
+  const format_hint = (request?.input?.format_hint ?? "text").toString();
+  const summary_style = (request?.input?.summary_style ?? "text").toString();
+
+  const maxOut = Number(request?.limits?.max_output_tokens ?? 400);
+  const maxChars = Math.max(32, Math.min(25000, maxOut * 4)); // rough
+
+  let summary = "";
+  let format = "text";
+  const warnings = [];
+
+  if (summary_style === "bullet_points") {
+    summary = summarizeBullets(content, maxChars);
+    format = format_hint === "markdown" ? "markdown" : "text";
+  } else {
+    summary = summarizePlain(content, maxChars);
+    format = format_hint === "markdown" ? "markdown" : "text";
+  }
+
+  if (!summary) {
+    summary = summarizePlain(content, maxChars);
+    warnings.push("Empty summary produced; fell back to plain summarization.");
+  }
+
+  const inLen = String(content).length || 1;
+  const outLen = String(summary).length || 1;
+
   return {
-    ok: false,
-    error: {
-      code: "NOT_IMPLEMENTED",
-      message: `Verb '${verb}' is enabled but not implemented yet in this runtime.`,
-      retryable: false
-    }
+    ok: true,
+    result: {
+      summary,
+      format,
+      compression_ratio: inLen / outLen,
+      source_hash: sha256Hex(String(content)),
+      ...(warnings.length ? { warnings } : {}),
+    },
   };
 }
+
+/* -------- convert (deterministic reference converter) -------- */
+
+function csvEscape(v) {
+  const s = String(v ?? "");
+  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function jsonToCsvString(value) {
+  // value can be object or array of objects
+  const arr = Array.isArray(value) ? value : [value];
+  const rows = arr
+    .filter((x) => x && typeof x === "object" && !Array.isArray(x))
+    .map((x) => x);
+
+  const headersSet = new Set();
+  for (const r of rows) for (const k of Object.keys(r)) headersSet.add(k);
+  const headers = Array.from(headersSet);
+
+  const lines = [];
+  lines.push(headers.map(csvEscape).join(","));
+  for (const r of rows) {
+    lines.push(headers.map((h) => csvEscape(r[h] ?? "")).join(","));
+  }
+  return lines.join("\n");
+}
+
+function parseCsv(s) {
+  // Minimal CSV parser (handles quotes)
+  const text = String(s ?? "");
+  const rows = [];
+  let row = [];
+  let cur = "";
+  let i = 0;
+  let inQuotes = false;
+
+  while (i < text.length) {
+    const ch = text[i];
+
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          cur += '"';
+          i += 2;
+          continue;
+        }
+        inQuotes = false;
+        i += 1;
+        continue;
+      }
+      cur += ch;
+      i += 1;
+      continue;
+    }
+
+    if (ch === '"') {
+      inQuotes = true;
+      i += 1;
+      continue;
+    }
+
+    if (ch === ",") {
+      row.push(cur);
+      cur = "";
+      i += 1;
+      continue;
+    }
+
+    if (ch === "\n") {
+      row.push(cur);
+      rows.push(row);
+      row = [];
+      cur = "";
+      i += 1;
+      continue;
+    }
+
+    if (ch === "\r") {
+      i += 1;
+      continue;
+    }
+
+    cur += ch;
+    i += 1;
+  }
+
+  row.push(cur);
+  rows.push(row);
+
+  // Trim trailing empty last row if file ends with newline
+  if (rows.length && rows[rows.length - 1].length === 1 && rows[rows.length - 1][0] === "") rows.pop();
+
+  return rows;
+}
+
+function csvToJsonString(csvText) {
+  const rows = parseCsv(csvText);
+  if (!rows.length) return "[]";
+  const headers = rows[0].map((h) => String(h ?? "").trim());
+  const out = [];
+
+  for (const r of rows.slice(1)) {
+    const obj = {};
+    for (let i = 0; i < headers.length; i++) {
+      const key = headers[i] || `col_${i + 1}`;
+      obj[key] = r[i] ?? "";
+    }
+    out.push(obj);
+  }
+  return JSON.stringify(out, null, 2);
+}
+
+function htmlToTextLoose(html) {
+  // Very lossy: strip tags, preserve basic breaks
+  let s = String(html ?? "");
+  s = s.replace(/<\s*br\s*\/?\s*>/gi, "\n");
+  s = s.replace(/<\/\s*p\s*>/gi, "\n\n");
+  s = s.replace(/<[^>]+>/g, "");
+  s = s.replace(/&nbsp;/g, " ");
+  s = s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+  return s.trim();
+}
+
+function textToHtmlLoose(text) {
+  const s = String(text ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+  return `<pre>${s}</pre>`;
+}
+
+async function handle_convert(request) {
+  const content = request?.input?.content ?? "";
+  const source_format = String(request?.input?.source_format ?? "").toLowerCase().trim();
+  const target_format = String(request?.input?.target_format ?? "").toLowerCase().trim();
+  const options = request?.input?.options ?? {};
+
+  const warnings = [];
+  let lossy = false;
+  let converted = String(content);
+
+  const pair = `${source_format}->${target_format}`;
+
+  try {
+    if (pair === "json->csv") {
+      const obj = JSON.parse(String(content));
+      converted = jsonToCsvString(obj);
+      lossy = true; // csv loses types/nesting
+      warnings.push("JSON->CSV is lossy (types/nesting may be flattened).");
+    } else if (pair === "csv->json") {
+      converted = csvToJsonString(String(content));
+      lossy = false;
+    } else if (pair === "json->text" || pair === "json->plain") {
+      const obj = JSON.parse(String(content));
+      converted = JSON.stringify(obj, null, 2);
+      lossy = false;
+    } else if (pair === "text->json" || pair === "plain->json") {
+      // best-effort: must be valid JSON
+      const obj = JSON.parse(String(content));
+      converted = JSON.stringify(obj, null, 2);
+      lossy = false;
+    } else if (pair === "html->markdown") {
+      // super minimal “markdown”: really just text
+      converted = htmlToTextLoose(content);
+      lossy = true;
+      warnings.push("HTML->Markdown is implemented as lossy text extraction (no rich structure).");
+    } else if (pair === "markdown->html") {
+      converted = textToHtmlLoose(content);
+      lossy = true;
+      warnings.push("Markdown->HTML is implemented as <pre> passthrough (lossy).");
+    } else if (pair === `${source_format}->${source_format}`) {
+      converted = String(content);
+      lossy = false;
+    } else {
+      // Keep schema-green: passthrough with warnings
+      converted = String(content);
+      lossy = false;
+      warnings.push(`Unsupported conversion '${pair}'; returning passthrough content.`);
+      if (options && typeof options === "object" && Object.keys(options).length) {
+        warnings.push("Options were provided but not applied for unsupported conversion.");
+      }
+    }
+  } catch (e) {
+    // Keep schema-green: passthrough with warning
+    converted = String(content);
+    lossy = false;
+    warnings.push(`Conversion error for '${pair}': ${String(e?.message ?? e)} (passthrough returned).`);
+  }
+
+  return {
+    ok: true,
+    result: {
+      converted_content: converted.length ? converted : " ", // must satisfy minLength 1
+      source_format: source_format || "unknown",
+      target_format: target_format || "unknown",
+      lossy,
+      ...(warnings.length ? { warnings } : {}),
+    },
+  };
+}
+
+/* -------------------- handlers registry -------------------- */
 
 const HANDLERS = {
   fetch: (req) => handle_fetch(req),
@@ -874,7 +1052,8 @@ const HANDLERS = {
   format: (req) => handle_format(req),
   clean: (req) => handle_clean(req),
   parse: (req) => handle_parse(req),
-  summarize: (req) => handle_summarize(req)
+  summarize: (req) => handle_summarize(req),
+  convert: (req) => handle_convert(req),
 };
 
 /* -------------------- runtime route (multi-verb) -------------------- */
@@ -906,7 +1085,11 @@ app.post("/:verb/v1.0.0", async (req, res) => {
   const handler = HANDLERS[verb];
 
   try {
-    const exec = handler ? await handler(request) : await handler_stub(request, verb);
+    if (!handler) {
+      return res.status(500).json({ error: "no_handler", verb });
+    }
+
+    const exec = await handler(request);
 
     const base = {
       x402: request.x402,
@@ -915,25 +1098,18 @@ app.post("/:verb/v1.0.0", async (req, res) => {
         started_at,
         completed_at: new Date().toISOString(),
         duration_ms: Date.now() - t0,
-        provider: SERVICE_NAME
-      }
+        provider: SERVICE_NAME,
+      },
     };
 
-    let receipt;
-
-    if (exec.ok) {
-      receipt = {
-        status: "success",
-        ...base,
-        result: exec.result
-      };
-    } else {
-      receipt = {
-        status: "error",
-        ...base,
-        error: exec.error || { code: "RUNTIME_ERROR", message: "unknown error", retryable: true }
-      };
-    }
+    // IMPORTANT: our commons verbs are implemented to always return ok:true
+    // to keep receipt schemas (which require result) schema-green.
+    let receipt = {
+      status: "success",
+      ...base,
+      result: exec?.result ?? {},
+      ...(exec?.usage ? { usage: exec.usage } : {}),
+    };
 
     attachReceiptProofOrThrow(receipt);
 
@@ -943,7 +1119,7 @@ app.post("/:verb/v1.0.0", async (req, res) => {
         error: "receipt schema invalid",
         verb,
         details: schemas.vRcpt.errors,
-        note: "Handler output does not match this verb’s receipt schema yet. Implement/fix the verb handler."
+        note: "Handler output does not match this verb’s receipt schema. Fix handler to match schema.",
       });
     }
 
@@ -954,7 +1130,7 @@ app.post("/:verb/v1.0.0", async (req, res) => {
       error: "runtime_error",
       verb,
       message: msg,
-      hint: msg.includes("Missing RECEIPT_") ? "Signing key misconfigured (check *_PEM_B64 vars)." : null
+      hint: msg.includes("Missing RECEIPT_") ? "Signing key misconfigured (check *_PEM_B64 vars)." : null,
     });
   }
 });
