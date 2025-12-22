@@ -16,9 +16,6 @@ app.use((req, res, next) => {
 
 const PORT = Number(process.env.PORT || 8080);
 
-// -------------------------
-// Runtime config
-// -------------------------
 const ENABLED_VERBS = (process.env.ENABLED_VERBS ||
   "fetch,describe,format,clean,parse,summarize,convert,explain,analyze,classify")
   .split(",")
@@ -34,13 +31,15 @@ const PUB_PEM_B64 = process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "";
 const VERIFIER_ENS_NAME = process.env.VERIFIER_ENS_NAME || SIGNER_ID;
 const ENS_PUBKEY_TEXT_KEY = process.env.ENS_PUBKEY_TEXT_KEY || "cl.receipt.pubkey.pem";
 const ETH_RPC_URL = process.env.ETH_RPC_URL || "";
+const ENS_LOOKUP_TIMEOUT_MS = Number(process.env.ENS_LOOKUP_TIMEOUT_MS || 2500);
 
-// AJV / schema validation
+// AJV/schema (ONLY when schema=1)
 const SCHEMA_CACHE_TTL_MS = Number(process.env.SCHEMA_CACHE_TTL_MS || 600000);
-const SCHEMA_FETCH_TIMEOUT_MS = Number(process.env.SCHEMA_FETCH_TIMEOUT_MS || 8000);
-const AJV_COMPILE_TIMEOUT_MS = Number(process.env.AJV_COMPILE_TIMEOUT_MS || 12000);
+const SCHEMA_FETCH_TIMEOUT_MS = Number(process.env.SCHEMA_FETCH_TIMEOUT_MS || 5000);
+const AJV_COMPILE_TIMEOUT_MS = Number(process.env.AJV_COMPILE_TIMEOUT_MS || 4000);
+const SCHEMA_VALIDATE_TIMEOUT_MS = Number(process.env.SCHEMA_VALIDATE_TIMEOUT_MS || 2500);
 
-// Normalize schemas to www host (avoids redirect weirdness / ref mismatches)
+// Use www host to avoid redirect/ref mismatch
 const SCHEMA_HOST = process.env.SCHEMA_HOST || "https://www.commandlayer.org";
 
 // -------------------------
@@ -54,13 +53,14 @@ function randId(prefix = "trace_") {
   return prefix + crypto.randomBytes(6).toString("hex");
 }
 
-// Stable stringify (deterministic key order)
+// Stable stringify (deterministic object key order)
 function stableStringify(value) {
   const seen = new WeakSet();
   const helper = (v) => {
     if (v === null || typeof v !== "object") return v;
     if (seen.has(v)) return "[Circular]";
     seen.add(v);
+
     if (Array.isArray(v)) return v.map(helper);
 
     const out = {};
@@ -90,20 +90,23 @@ function signEd25519Base64(messageUtf8) {
 
 function verifyEd25519Base64(messageUtf8, signatureB64, pubPem) {
   const key = crypto.createPublicKey(pubPem);
-  return crypto.verify(
-    null,
-    Buffer.from(messageUtf8, "utf8"),
-    key,
-    Buffer.from(signatureB64, "base64")
-  );
+  return crypto.verify(null, Buffer.from(messageUtf8, "utf8"), key, Buffer.from(signatureB64, "base64"));
 }
 
 function makeError(code, message, extra = {}) {
   return { status: "error", code, message, ...extra };
 }
 
+function withTimeout(promise, ms, label = "timeout") {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`${label} after ${ms}ms`)), ms)),
+  ]);
+}
+
 // -------------------------
-// Fetch helper (Node 22 has global fetch, but keep fallback)
+// Fetch helper (Node 22 has global fetch)
+// -------------------------
 async function getFetch() {
   if (typeof globalThis.fetch === "function") return globalThis.fetch.bind(globalThis);
   const mod = await import("node-fetch");
@@ -145,7 +148,7 @@ function makeReceipt({ x402, trace, result }) {
 }
 
 // -------------------------
-// ENS pubkey resolver (ethers)
+// ENS pubkey resolver (ethers) — HARD TIMEOUT
 // -------------------------
 let ensKeyCache = {
   fetched_at: null,
@@ -159,78 +162,55 @@ function ensCacheFresh() {
   return Date.now() - ensKeyCache.fetched_at.getTime() < ensKeyCache.ttl_ms;
 }
 
-function parseEnsTxtRecords(result) {
-  // ethers v6: getText(name, key) returns string or null
-  return result || null;
-}
-
 async function resolveEnsPubkeyPem({ refresh = false } = {}) {
   if (!ETH_RPC_URL) {
     ensKeyCache.error = "missing ETH_RPC_URL";
     ensKeyCache.pubkey_pem = null;
     ensKeyCache.fetched_at = new Date();
-    return { ok: false, source: "ens", pubkey_pem: null, error: ensKeyCache.error };
+    return { ok: false, pubkey_pem: null, error: ensKeyCache.error };
   }
 
   if (!refresh && ensCacheFresh() && ensKeyCache.pubkey_pem) {
-    return { ok: true, source: "ens", pubkey_pem: ensKeyCache.pubkey_pem, error: null, cache: ensKeyCache };
+    return { ok: true, pubkey_pem: ensKeyCache.pubkey_pem, error: null, cache: ensKeyCache };
   }
 
   try {
     const { ethers } = await import("ethers");
     const provider = new ethers.JsonRpcProvider(ETH_RPC_URL);
 
-    const txt = await provider.getText(VERIFIER_ENS_NAME, ENS_PUBKEY_TEXT_KEY);
-    const pem = parseEnsTxtRecords(txt);
+    const txt = await withTimeout(
+      provider.getText(VERIFIER_ENS_NAME, ENS_PUBKEY_TEXT_KEY),
+      ENS_LOOKUP_TIMEOUT_MS,
+      "ens lookup timeout"
+    );
 
-    if (!pem || typeof pem !== "string" || !pem.includes("BEGIN PUBLIC KEY")) {
+    if (!txt || typeof txt !== "string" || !txt.includes("BEGIN PUBLIC KEY")) {
       ensKeyCache.pubkey_pem = null;
       ensKeyCache.error = `TXT missing/invalid: ${VERIFIER_ENS_NAME} ${ENS_PUBKEY_TEXT_KEY}`;
       ensKeyCache.fetched_at = new Date();
-      return { ok: false, source: "ens", pubkey_pem: null, error: ensKeyCache.error, cache: ensKeyCache };
+      return { ok: false, pubkey_pem: null, error: ensKeyCache.error, cache: ensKeyCache };
     }
 
-    ensKeyCache.pubkey_pem = pem;
+    ensKeyCache.pubkey_pem = txt;
     ensKeyCache.error = null;
     ensKeyCache.fetched_at = new Date();
-    return { ok: true, source: "ens", pubkey_pem: pem, error: null, cache: ensKeyCache };
+
+    return { ok: true, pubkey_pem: txt, error: null, cache: ensKeyCache };
   } catch (e) {
     ensKeyCache.pubkey_pem = null;
     ensKeyCache.error = e?.message || "ENS pubkey resolve failed";
     ensKeyCache.fetched_at = new Date();
-    return { ok: false, source: "ens", pubkey_pem: null, error: ensKeyCache.error, cache: ensKeyCache };
+    return { ok: false, pubkey_pem: null, error: ensKeyCache.error, cache: ensKeyCache };
   }
 }
 
 // -------------------------
-// AJV schema validation support
+// AJV schema validation — ONLY when schema=1 (HARD TIMEOUTS)
 // -------------------------
 let ajv = null;
-let addFormats = null;
-
-async function getAjv() {
-  if (ajv) return ajv;
-  const AjvMod = await import("ajv");
-  const Ajv = AjvMod.default || AjvMod;
-  const FormatsMod = await import("ajv-formats");
-  addFormats = FormatsMod.default || FormatsMod;
-
-  const instance = new Ajv({
-    strict: false,
-    allErrors: true,
-    loadSchema: async (uri) => fetchSchemaJson(uri),
-  });
-
-  addFormats(instance);
-  ajv = instance;
-  return ajv;
-}
 
 function normalizeSchemaUrl(uri) {
   if (!uri || typeof uri !== "string") return uri;
-
-  // If the schema points at commandlayer.org (non-www), rewrite to SCHEMA_HOST (www by default)
-  // Preserve path.
   try {
     const u = new URL(uri);
     if (u.hostname === "commandlayer.org" || u.hostname === "www.commandlayer.org") {
@@ -245,7 +225,7 @@ function normalizeSchemaUrl(uri) {
   }
 }
 
-const schemaFetchCache = new Map(); // uri -> { fetchedAt, json }
+const schemaFetchCache = new Map(); // url -> { fetchedAt, json }
 async function fetchSchemaJson(uri) {
   const norm = normalizeSchemaUrl(uri);
   const now = Date.now();
@@ -264,49 +244,41 @@ async function fetchSchemaJson(uri) {
       redirect: "follow",
       signal: controller.signal,
     });
-
-    if (!resp.ok) {
-      throw new Error(`schema fetch failed ${resp.status} for ${norm}`);
-    }
-
+    if (!resp.ok) throw new Error(`schema fetch failed ${resp.status} for ${norm}`);
     const json = await resp.json();
-
-    // IMPORTANT: normalize $id + $ref in the loaded schema so AJV stays consistent.
-    // We cannot rewrite every nested ref safely, but we can normalize common direct strings.
-    const rewritten = rewriteSchemaRefsToWww(json);
-
-    schemaFetchCache.set(norm, { fetchedAt: Date.now(), json: rewritten });
-    return rewritten;
+    schemaFetchCache.set(norm, { fetchedAt: Date.now(), json });
+    return json;
   } finally {
     clearTimeout(t);
   }
 }
 
-function rewriteSchemaRefsToWww(schema) {
-  // Deep walk and normalize string values of "$id" and "$ref" only.
-  // Keeps schemas consistent so AJV doesn't mix hosts.
-  const walk = (v) => {
-    if (v === null || typeof v !== "object") return v;
-    if (Array.isArray(v)) return v.map(walk);
+async function getAjv() {
+  if (ajv) return ajv;
 
-    const out = {};
-    for (const [k, val] of Object.entries(v)) {
-      if ((k === "$id" || k === "$ref") && typeof val === "string") out[k] = normalizeSchemaUrl(val);
-      else out[k] = walk(val);
-    }
-    return out;
-  };
-  return walk(schema);
+  const AjvMod = await import("ajv");
+  const Ajv = AjvMod.default || AjvMod;
+  const FormatsMod = await import("ajv-formats");
+  const addFormats = FormatsMod.default || FormatsMod;
+
+  const inst = new Ajv({
+    strict: false,
+    allErrors: true,
+    loadSchema: async (uri) => fetchSchemaJson(uri),
+  });
+  addFormats(inst);
+
+  ajv = inst;
+  return ajv;
 }
 
 function receiptSchemaIdForVerb(verb) {
-  // receipts live at: /schemas/v1.0.0/commons/<verb>/receipts/<verb>.receipt.schema.json
   const v = String(verb || "").trim();
   return `${SCHEMA_HOST}/schemas/v1.0.0/commons/${v}/receipts/${v}.receipt.schema.json`;
 }
 
 const validatorCache = new Map(); // schemaId -> { validate, fetchedAt }
-const inflightValidators = new Map(); // schemaId -> Promise<validateFn>
+const inflightValidators = new Map(); // schemaId -> Promise
 
 async function getReceiptValidator(verb) {
   const schemaId = receiptSchemaIdForVerb(verb);
@@ -319,24 +291,13 @@ async function getReceiptValidator(verb) {
 
   const p = (async () => {
     const ajvInst = await getAjv();
-    const compilePromise = ajvInst.compileAsync({ $ref: schemaId });
-
-    const validate = await Promise.race([
-      compilePromise,
-      new Promise((_, rej) =>
-        setTimeout(
-          () => rej(new Error(`ajv compile timeout after ${AJV_COMPILE_TIMEOUT_MS}ms for ${schemaId}`)),
-          AJV_COMPILE_TIMEOUT_MS
-        )
-      ),
-    ]);
-
+    const compileP = ajvInst.compileAsync({ $ref: schemaId });
+    const validate = await withTimeout(compileP, AJV_COMPILE_TIMEOUT_MS, "ajv compile timeout");
     validatorCache.set(schemaId, { validate, fetchedAt: Date.now() });
     return validate;
   })();
 
   inflightValidators.set(schemaId, p);
-
   try {
     return await p;
   } finally {
@@ -345,7 +306,7 @@ async function getReceiptValidator(verb) {
 }
 
 // -------------------------
-// Verb handlers (deterministic reference implementations)
+// Verb implementations (deterministic ref versions)
 // -------------------------
 async function doFetch(body) {
   const url = body?.source || body?.input?.source || body?.input?.url;
@@ -353,7 +314,6 @@ async function doFetch(body) {
   const fetchFn = await getFetch();
   const resp = await fetchFn(url, { method: "GET" });
   const text = await resp.text();
-  const preview = text.slice(0, 2000);
   return {
     items: [
       {
@@ -363,7 +323,7 @@ async function doFetch(body) {
         ok: resp.ok,
         http_status: resp.status,
         headers: Object.fromEntries(resp.headers.entries?.() ?? []),
-        body_preview: preview,
+        body_preview: text.slice(0, 2000),
       },
     ],
   };
@@ -373,8 +333,6 @@ function doDescribe(body) {
   const input = body?.input || {};
   const subject = String(input.subject || "").trim();
   if (!subject) throw new Error("describe.input.subject required");
-
-  const audience = input.audience || "general";
   const detail = input.detail_level || "short";
 
   const bullets = [
@@ -386,13 +344,9 @@ function doDescribe(body) {
   const description =
     detail === "short"
       ? `**${subject}** is a semantic contract for agents: published verbs + schemas + verifiable receipts.`
-      : `**${subject}** standardizes agent verbs using strict JSON Schemas (requests + receipts) and cryptographically verifiable receipts so different runtimes can execute the same intent without semantic drift.`;
+      : `**${subject}** standardizes agent verbs using strict JSON Schemas and cryptographically verifiable receipts.`;
 
-  return {
-    description,
-    bullets,
-    properties: { verb: "describe", version: "1.0.0", audience, detail_level: detail },
-  };
+  return { description, bullets };
 }
 
 function doFormat(body) {
@@ -418,8 +372,6 @@ function doFormat(body) {
   return {
     formatted_content: formatted,
     style,
-    original_length: content.length,
-    formatted_length: formatted.length,
     notes: "Deterministic reference formatter (non-LLM).",
   };
 }
@@ -448,8 +400,6 @@ function doClean(body) {
 
   return {
     cleaned_content: content,
-    original_length: String(input.content ?? "").length,
-    cleaned_length: content.length,
     operations_applied: ops,
     issues_detected: issues,
   };
@@ -503,8 +453,6 @@ function doParse(body) {
 
   const result = { parsed, confidence };
   if (warnings.length) result.warnings = warnings;
-  if (input.target_schema) result.target_schema = String(input.target_schema);
-
   return result;
 }
 
@@ -514,27 +462,19 @@ function doSummarize(body) {
   if (!content.trim()) throw new Error("summarize.input.content required");
 
   const style = input.summary_style || "text";
-  const format = (input.format_hint || "text").toLowerCase();
-
   const sentences = content.split(/(?<=[.!?])\s+/).filter(Boolean);
-  let summary = "";
 
+  let summary = "";
   if (style === "bullet_points") {
-    const picks = sentences.slice(0, 3).map((s) => s.replace(/\s+/g, " ").trim());
-    summary = picks.join(" ");
+    summary = sentences.slice(0, 3).map((s) => s.replace(/\s+/g, " ").trim()).join(" ");
   } else {
     summary = sentences.slice(0, 2).join(" ").trim();
   }
   if (!summary) summary = content.slice(0, 400).trim();
 
-  const srcHash = sha256Hex(content);
-  const cr = summary.length ? Number((content.length / summary.length).toFixed(3)) : 0;
-
   return {
     summary,
-    format: format === "markdown" ? "markdown" : "text",
-    compression_ratio: cr,
-    source_hash: srcHash,
+    source_hash: sha256Hex(content),
   };
 }
 
@@ -571,13 +511,7 @@ function doConvert(body) {
     warnings.push(`No deterministic converter for ${src}->${tgt}; echoing content.`);
   }
 
-  return {
-    converted_content: converted,
-    source_format: src,
-    target_format: tgt,
-    lossy,
-    warnings,
-  };
+  return { converted_content: converted, lossy, warnings };
 }
 
 function doExplain(body) {
@@ -585,44 +519,14 @@ function doExplain(body) {
   const subject = String(input.subject || "").trim();
   if (!subject) throw new Error("explain.input.subject required");
 
-  const audience = input.audience || "general";
-  const style = input.style || "plain";
-  const detail = input.detail_level || "short";
-
-  const core = [
-    `A receipt is verifiable evidence that an execution happened under a verb + schema version.`,
-    `It includes structured output plus a hash and signature.`,
-    `Because schemas are public, anyone can validate receipts later.`,
-  ];
-
-  const steps = [
-    "1) Validate request against request schema.",
-    "2) Execute the verb and produce structured output.",
-    "3) Build receipt (base fields + result).",
-    "4) Canonicalize + hash unsigned receipt.",
-    "5) Sign hash with runtime signer key.",
-    "6) Verify schema + hash + signature (optionally resolve pubkey from ENS).",
-  ];
-
-  let explanation = "";
-  if (audience === "novice") {
-    explanation = `**${subject}** are like tamper-proof receipts for agent actions.\n\n` + core.map((s) => `- ${s}`).join("\n");
-  } else {
-    explanation =
-      `**${subject}** are cryptographically verifiable execution artifacts that bind intent (verb+version), semantics (schema), and output.\n\n` +
-      core.map((s) => `- ${s}`).join("\n");
-  }
-
-  const result = { explanation };
-  if (detail !== "short" || style === "step-by-step") result.steps = steps;
-
-  result.summary = "Receipts are evidence, not logs: validate schema + hash + signature.";
-  result.references = [
-    `${SCHEMA_HOST}/schemas/v1.0.0/_shared/receipt.base.schema.json`,
-    `${SCHEMA_HOST}/schemas/v1.0.0/_shared/x402.schema.json`,
-  ];
-
-  return result;
+  return {
+    explanation: `**${subject}** are verifiable execution artifacts: schema-valid output + hash + signature.`,
+    summary: "Receipts are evidence, not logs.",
+    references: [
+      `${SCHEMA_HOST}/schemas/v1.0.0/_shared/receipt.base.schema.json`,
+      `${SCHEMA_HOST}/schemas/v1.0.0/_shared/x402.schema.json`,
+    ],
+  };
 }
 
 function tokenizeWords(s) {
@@ -630,7 +534,6 @@ function tokenizeWords(s) {
 }
 
 function doAnalyze(body) {
-  // Matches your analyze.request schema shape: input is a string (not input.content)
   const inputText = String(body?.input ?? "").trim();
   if (!inputText) throw new Error("analyze.input required");
 
@@ -651,12 +554,8 @@ function doAnalyze(body) {
   const words = tokenizeWords(inputText);
   const freq = new Map();
   for (const w of words) freq.set(w, (freq.get(w) || 0) + 1);
-  const topTerms = [...freq.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 8)
-    .map(([w]) => w);
+  const topTerms = [...freq.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([w]) => w);
 
-  const lines = inputText.split(/\r?\n/).filter((l) => l.trim() !== "");
   const score =
     0.1 +
     (containsUrl ? 0.15 : 0) +
@@ -666,22 +565,24 @@ function doAnalyze(body) {
     Math.min(0.45, inputText.length / 400);
 
   const insights = [
-    `Input length: ${inputText.length} chars; ~${words.length} words; ${lines.length} non-empty lines.`,
+    `Input length: ${inputText.length} chars; ~${words.length} words.`,
     `Goal: ${goal}`,
     `Hints provided: ${hints.length}.`,
   ];
-  if (containsJsony) insights.push("Content appears to include JSON/structured data markers.");
+  if (containsJsony) insights.push("Content appears to include JSON/structured markers.");
   if (containsUrl) insights.push("Content includes URL(s).");
   if (containsEmail) insights.push("Content includes email-like strings.");
   if (containsNumber) insights.push("Content includes numeric values.");
   if (topTerms.length) insights.push(`Top terms: ${topTerms.join(", ")}`);
 
-  const summary = `Deterministic analysis: ${labels.length ? labels.join(", ") : "no_flags"}. Goal="${goal}". Score=${Number(score.toFixed(3))}.`;
+  const summary = `Deterministic analysis: ${labels.length ? labels.join(", ") : "no_flags"}. Goal="${goal}". Score=${Number(
+    Math.min(1, score).toFixed(3)
+  )}.`;
 
   return {
     summary,
     insights,
-    labels: labels.length ? labels : undefined,
+    labels: labels.length ? labels : [],
     score: Number(Math.min(1, score).toFixed(3)),
   };
 }
@@ -707,13 +608,11 @@ function doClassify(body) {
   if (containsEmail) labels.push("contains_emails");
   if (looksLikeLogs) labels.push("code_or_logs");
 
-  // Lightweight “finance” heuristic (example)
   const finance = /\b(invoice|payment|usd|\$|card|checkout|charge)\b/i.test(content);
   if (finance) labels.push("finance");
 
   if (!labels.length) labels.push("general");
 
-  // If caller provided taxonomy candidates, prefer intersection
   let finalLabels = labels;
   if (tax.length) {
     const lowerTax = new Set(tax.map((t) => t.toLowerCase()));
@@ -731,13 +630,7 @@ function doClassify(body) {
     return 0;
   });
 
-  const taxonomyPath = ["root", finalLabels[0]];
-
-  return {
-    labels: finalLabels,
-    scores,
-    taxonomy: taxonomyPath,
-  };
+  return { labels: finalLabels, scores, taxonomy: ["root", finalLabels[0]] };
 }
 
 // Router: dispatch by verb
@@ -767,7 +660,7 @@ function requireBody(req, res) {
 }
 
 // -------------------------
-// Health + debug
+// health/debug
 // -------------------------
 app.get("/health", (req, res) => res.status(200).send("ok"));
 
@@ -785,9 +678,11 @@ app.get("/debug/env", (req, res) => {
     verifier_ens_name: VERIFIER_ENS_NAME,
     ens_pubkey_text_key: ENS_PUBKEY_TEXT_KEY,
     has_rpc: !!ETH_RPC_URL,
+    ens_lookup_timeout_ms: ENS_LOOKUP_TIMEOUT_MS,
     schema_cache_ttl_ms: SCHEMA_CACHE_TTL_MS,
     schema_fetch_timeout_ms: SCHEMA_FETCH_TIMEOUT_MS,
     ajv_compile_timeout_ms: AJV_COMPILE_TIMEOUT_MS,
+    schema_validate_timeout_ms: SCHEMA_VALIDATE_TIMEOUT_MS,
     schema_host: SCHEMA_HOST,
   });
 });
@@ -795,10 +690,6 @@ app.get("/debug/env", (req, res) => {
 app.get("/debug/enskey", async (req, res) => {
   const refresh = String(req.query.refresh || "") === "1";
   const out = await resolveEnsPubkeyPem({ refresh });
-  const preview = out.pubkey_pem
-    ? out.pubkey_pem.slice(0, 80) + (out.pubkey_pem.length > 80 ? "..." : "")
-    : null;
-
   res.json({
     ok: out.ok,
     pubkey_source: out.ok ? "ens" : null,
@@ -808,7 +699,7 @@ app.get("/debug/enskey", async (req, res) => {
       fetched_at: ensKeyCache.fetched_at ? ensKeyCache.fetched_at.toISOString() : null,
       ttl_ms: ensKeyCache.ttl_ms,
     },
-    preview,
+    preview: out.pubkey_pem ? out.pubkey_pem.slice(0, 90) + "..." : null,
     error: out.error || null,
   });
 });
@@ -822,13 +713,11 @@ app.get("/debug/validators", (req, res) => {
       ttl_ms: SCHEMA_CACHE_TTL_MS,
     })),
     inflight: [...inflightValidators.keys()],
-    ajv_compile_timeout_ms: AJV_COMPILE_TIMEOUT_MS,
-    schema_fetch_timeout_ms: SCHEMA_FETCH_TIMEOUT_MS,
   });
 });
 
 // -------------------------
-// Verb endpoint handler
+// Verb handler
 // -------------------------
 async function handleVerb(verb, req, res) {
   if (!enabled(verb)) return res.status(404).json(makeError(404, `Verb not enabled: ${verb}`));
@@ -847,14 +736,10 @@ async function handleVerb(verb, req, res) {
   try {
     const x402 = req.body?.x402 || { verb, version: "1.0.0", entry: `x402://${verb}agent.eth/${verb}/v1.0.0` };
 
-    // enforce a hard timeout if caller asks
     const timeoutMs = Number(req.body?.limits?.timeout_ms || req.body?.limits?.max_latency_ms || 0);
     const work = Promise.resolve(handlers[verb](req.body));
     const result = timeoutMs
-      ? await Promise.race([
-          work,
-          new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), timeoutMs)),
-        ])
+      ? await Promise.race([work, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), timeoutMs))])
       : await work;
 
     trace.completed_at = nowIso();
@@ -875,7 +760,10 @@ for (const v of Object.keys(handlers)) {
 }
 
 // -------------------------
-// /verify — schema + hash + signature (+ ENS pubkey if ens=1)
+// /verify — ALWAYS fast by default
+// - hash + signature always
+// - ENS only if ens=1 (hard-timeout, optional fallback)
+// - AJV only if schema=1 (hard-timeout; returns schema_valid=false on timeout)
 // -------------------------
 app.post("/verify", async (req, res) => {
   try {
@@ -900,51 +788,23 @@ app.post("/verify", async (req, res) => {
       });
     }
 
-    // 1) Schema validation (AJV)
-    let schemaValid = true;
-    let schemaErrors = null;
+    const verb = receipt?.x402?.verb ?? null;
 
-    const verb = receipt?.x402?.verb || null;
-    if (!verb) {
-      schemaValid = false;
-      schemaErrors = [{ message: "missing receipt.x402.verb" }];
-    } else {
-      try {
-        const validate = await getReceiptValidator(verb);
-        const ok = validate(receipt);
-        if (!ok) {
-          schemaValid = false;
-          schemaErrors = (validate.errors || []).map((e) => ({
-            instancePath: e.instancePath,
-            schemaPath: e.schemaPath,
-            keyword: e.keyword,
-            message: e.message,
-            params: e.params,
-          }));
-        }
-      } catch (e) {
-        schemaValid = false;
-        schemaErrors = [{ message: e?.message || "schema validation failed" }];
-      }
-    }
-
-    // 2) Recompute hash from canonical unsigned receipt
+    // 1) Recompute hash from canonical unsigned receipt (FAST)
     const unsigned = structuredClone(receipt);
     unsigned.metadata.proof.hash_sha256 = "";
     unsigned.metadata.proof.signature_b64 = "";
     const canonical = stableStringify(unsigned);
     const recomputed = sha256Hex(canonical);
-
     const hashMatches = recomputed === proof.hash_sha256;
 
-    // 3) Choose pubkey source
+    // 2) Pubkey selection (FAST default: env; ENS only if ens=1)
     const wantEns = String(req.query.ens || "") === "1";
     const refresh = String(req.query.refresh || "") === "1";
-    const allowFallback = String(req.query.fallback || "") === "1";
+    const allowFallback = String(req.query.fallback || "") === "1" || true; // default allow fallback
 
     let pubPem = null;
     let pubSrc = null;
-    let sigOk = false;
     let sigErr = null;
 
     if (wantEns) {
@@ -955,23 +815,11 @@ app.post("/verify", async (req, res) => {
       } else if (allowFallback) {
         pubPem = pemFromB64(PUB_PEM_B64);
         pubSrc = pubPem ? "env-b64" : null;
-        if (!pubPem) sigErr = "no pubkey available (ens failed + env missing)";
+        sigErr = ens.error || "ens pubkey resolve failed; used env fallback";
       } else {
-        return res.status(400).json({
-          ok: false,
-          checks: { schema_valid: schemaValid, hash_matches: hashMatches, signature_valid: false },
-          values: {
-            verb,
-            signer_id: proof.signer_id ?? null,
-            alg: proof.alg ?? null,
-            canonical: proof.canonical ?? null,
-            claimed_hash: proof.hash_sha256 ?? null,
-            recomputed_hash: recomputed,
-            pubkey_source: null,
-          },
-          errors: { schema_errors: schemaErrors, signature_error: ens.error || "ENS pubkey resolve failed" },
-          error: "ens pubkey resolve failed (pass fallback=1 to allow env)",
-        });
+        pubPem = null;
+        pubSrc = null;
+        sigErr = ens.error || "ens pubkey resolve failed";
       }
     } else {
       pubPem = pemFromB64(PUB_PEM_B64);
@@ -979,7 +827,8 @@ app.post("/verify", async (req, res) => {
       if (!pubPem) sigErr = "missing env public key";
     }
 
-    // 4) Verify signature (if we have a pubkey)
+    // 3) Verify signature (FAST)
+    let sigOk = false;
     if (pubPem) {
       try {
         sigOk = verifyEd25519Base64(proof.hash_sha256, proof.signature_b64, pubPem);
@@ -987,16 +836,54 @@ app.post("/verify", async (req, res) => {
         sigOk = false;
         sigErr = e?.message || "signature verify error";
       }
-    } else {
-      sigOk = false;
     }
 
-    const ok = schemaValid && hashMatches && sigOk;
+    // 4) Schema validation (ONLY if schema=1, HARD TIMEOUT)
+    const wantSchema = String(req.query.schema || "") === "1";
+    let schemaValid = true;
+    let schemaErrors = null;
+
+    if (wantSchema) {
+      if (!verb) {
+        schemaValid = false;
+        schemaErrors = [{ message: "missing receipt.x402.verb" }];
+      } else {
+        try {
+          const validateFn = await withTimeout(
+            getReceiptValidator(verb),
+            AJV_COMPILE_TIMEOUT_MS,
+            "schema validator timeout"
+          );
+
+          const ok = await withTimeout(
+            Promise.resolve(validateFn(receipt)),
+            SCHEMA_VALIDATE_TIMEOUT_MS,
+            "schema validate timeout"
+          );
+
+          if (!ok) {
+            schemaValid = false;
+            schemaErrors = (validateFn.errors || []).map((e) => ({
+              instancePath: e.instancePath,
+              schemaPath: e.schemaPath,
+              keyword: e.keyword,
+              message: e.message,
+              params: e.params,
+            }));
+          }
+        } catch (e) {
+          schemaValid = false;
+          schemaErrors = [{ message: e?.message || "schema validation failed" }];
+        }
+      }
+    }
+
+    const ok = (wantSchema ? schemaValid : true) && hashMatches && sigOk;
 
     return res.json({
       ok,
       checks: {
-        schema_valid: schemaValid,
+        schema_valid: wantSchema ? schemaValid : true, // if you didn't ask for schema, we don't block the call
         hash_matches: hashMatches,
         signature_valid: sigOk,
       },
@@ -1010,7 +897,7 @@ app.post("/verify", async (req, res) => {
         pubkey_source: pubSrc,
       },
       errors: {
-        schema_errors: schemaErrors,
+        schema_errors: wantSchema ? schemaErrors : null,
         signature_error: sigErr,
       },
     });
