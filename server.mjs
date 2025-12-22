@@ -9,6 +9,7 @@ import { JsonRpcProvider } from "ethers";
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
+// ---- basic CORS
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -24,34 +25,21 @@ const ENABLED_VERBS = (process.env.ENABLED_VERBS || "fetch")
   .map((s) => s.trim())
   .filter(Boolean);
 
-const SIGNER_ID =
-  process.env.RECEIPT_SIGNER_ID || process.env.ENS_NAME || "runtime";
-
+const SIGNER_ID = process.env.RECEIPT_SIGNER_ID || process.env.ENS_NAME || "runtime";
 const PRIV_PEM_B64 = process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64 || "";
 const PUB_PEM_B64 = process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "";
 
-const VERIFIER_ENS_NAME =
-  process.env.VERIFIER_ENS_NAME || process.env.ENS_NAME || SIGNER_ID;
-
-const ENS_PUBKEY_TEXT_KEY =
-  process.env.ENS_PUBKEY_TEXT_KEY || "cl.receipt.pubkey.pem";
-
+const VERIFIER_ENS_NAME = process.env.VERIFIER_ENS_NAME || process.env.ENS_NAME || SIGNER_ID;
+const ENS_PUBKEY_TEXT_KEY = process.env.ENS_PUBKEY_TEXT_KEY || "cl.receipt.pubkey.pem";
 const ETH_RPC_URL = process.env.ETH_RPC_URL || "";
-
-// IMPORTANT: keep www to avoid 307 issues
-const SCHEMA_HOST = process.env.SCHEMA_HOST || "https://www.commandlayer.org";
 
 const ENS_CACHE_TTL_MS = Number(process.env.ENS_CACHE_TTL_MS || 600_000);
 const SCHEMA_CACHE_TTL_MS = Number(process.env.SCHEMA_CACHE_TTL_MS || 600_000);
+const SCHEMA_FETCH_TIMEOUT_MS = Number(process.env.SCHEMA_FETCH_TIMEOUT_MS || 8000);
+const SCHEMA_VALIDATE_BUDGET_MS = Number(process.env.SCHEMA_VALIDATE_BUDGET_MS || 3500);
 
-const SCHEMA_FETCH_TIMEOUT_MS = Number(
-  process.env.SCHEMA_FETCH_TIMEOUT_MS || 8000
-);
-
-// Hard cap for *entire* schema validation phase so /verify never 502s
-const SCHEMA_VALIDATE_BUDGET_MS = Number(
-  process.env.SCHEMA_VALIDATE_BUDGET_MS || 3500
-);
+// IMPORTANT: use non-www because your $id/$ref use https://commandlayer.org/...
+const SCHEMA_HOST = process.env.SCHEMA_HOST || "https://commandlayer.org";
 
 function nowIso() {
   return new Date().toISOString();
@@ -61,6 +49,7 @@ function randId(prefix = "trace_") {
   return prefix + crypto.randomBytes(6).toString("hex");
 }
 
+// Stable stringify (deterministic object key order)
 function stableStringify(value) {
   const seen = new WeakSet();
   const helper = (v) => {
@@ -89,10 +78,7 @@ function normalizePem(maybePem) {
   if (!maybePem) return null;
   let s = String(maybePem).trim();
   s = s.replace(/\\n/g, "\n");
-  if (
-    (s.startsWith('"') && s.endsWith('"')) ||
-    (s.startsWith("'") && s.endsWith("'"))
-  ) {
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
     s = s.slice(1, -1).trim();
   }
   if (!s.includes("BEGIN PUBLIC KEY")) return null;
@@ -110,12 +96,7 @@ function signEd25519Base64(messageUtf8) {
 function verifyEd25519Base64(messageUtf8, signatureB64, pubPem) {
   const normalized = normalizePem(pubPem) || pubPem;
   const key = crypto.createPublicKey(normalized);
-  return crypto.verify(
-    null,
-    Buffer.from(messageUtf8, "utf8"),
-    key,
-    Buffer.from(signatureB64, "base64")
-  );
+  return crypto.verify(null, Buffer.from(messageUtf8, "utf8"), key, Buffer.from(signatureB64, "base64"));
 }
 
 function makeReceipt({ x402, trace, result }) {
@@ -154,16 +135,14 @@ function makeError(code, message, extra = {}) {
 }
 
 function withTimeoutPromise(p, ms, label = "timeout") {
-  return Promise.race([
-    p,
-    new Promise((_, rej) => setTimeout(() => rej(new Error(label)), ms)),
-  ]);
+  return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(label)), ms))]);
 }
 
 async function fetchJsonWithTimeout(url) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), SCHEMA_FETCH_TIMEOUT_MS);
   try {
+    // node-fetch follows redirects by default
     const r = await fetch(url, { method: "GET", signal: controller.signal });
     if (!r.ok) throw new Error(`schema fetch failed ${r.status} for ${url}`);
     return await r.json();
@@ -174,19 +153,11 @@ async function fetchJsonWithTimeout(url) {
 
 // ---------------- ENS
 
-const ensCache = {
-  fetched_at: null,
-  value_pem: null,
-  error: null,
-};
+const ensCache = { fetched_at: null, value_pem: null, error: null };
 
 async function resolveEnsPubkeyPem({ refresh = false } = {}) {
   const now = Date.now();
-  if (
-    !refresh &&
-    ensCache.fetched_at &&
-    now - ensCache.fetched_at < ENS_CACHE_TTL_MS
-  ) {
+  if (!refresh && ensCache.fetched_at && now - ensCache.fetched_at < ENS_CACHE_TTL_MS) {
     return {
       ok: !!ensCache.value_pem,
       pem: ensCache.value_pem,
@@ -200,7 +171,7 @@ async function resolveEnsPubkeyPem({ refresh = false } = {}) {
     ensCache.fetched_at = now;
     ensCache.value_pem = null;
     ensCache.error = "Missing ETH_RPC_URL";
-    return { ok: false, pem: null, source: "ens", error: ensCache.error };
+    return { ok: false, pem: null, source: "ens", error: ensCache.error, fetched_at: now };
   }
 
   try {
@@ -224,20 +195,25 @@ async function resolveEnsPubkeyPem({ refresh = false } = {}) {
   }
 }
 
-// ------------- AJV (SAFE MODE)
+// ---------------- AJV (recursive $ref preload)
 
 const schemaCache = new Map(); // url -> { fetched_at, json }
 const validatorCache = new Map(); // verb -> validateFn
 const inflight = new Map(); // verb -> Promise
 
-const ajv = new Ajv({
-  strict: false,
-  allErrors: true,
-});
+const ajv = new Ajv({ strict: false, allErrors: true });
 addFormats(ajv);
 
 function receiptSchemaUrlForVerb(verb) {
   return `${SCHEMA_HOST}/schemas/v1.0.0/commons/${verb}/receipts/${verb}.receipt.schema.json`;
+}
+
+// normalize www/non-www for aliasing
+function aliasUrls(url) {
+  const out = new Set([url]);
+  if (url.startsWith("https://www.commandlayer.org")) out.add(url.replace("https://www.commandlayer.org", "https://commandlayer.org"));
+  if (url.startsWith("https://commandlayer.org")) out.add(url.replace("https://commandlayer.org", "https://www.commandlayer.org"));
+  return Array.from(out);
 }
 
 async function getSchemaJson(url) {
@@ -250,14 +226,50 @@ async function getSchemaJson(url) {
   return json;
 }
 
-/**
- * SAFE validator compilation:
- * - fetch the verb receipt schema JSON
- * - compile it synchronously (no compileAsync)
- * NOTE: This assumes your published receipt schemas use absolute $ref URLs
- * that Ajv can resolve from its in-memory schema pool OR not at all.
- * If $refs exist, we still avoid hangs by time-budgets (we fail fast).
- */
+function collectRefs(schema) {
+  const refs = new Set();
+  const walk = (node) => {
+    if (!node || typeof node !== "object") return;
+    if (typeof node.$ref === "string") refs.add(node.$ref);
+    for (const v of Object.values(node)) walk(v);
+  };
+  walk(schema);
+  return Array.from(refs);
+}
+
+async function ensureSchemaLoaded(url, seen) {
+  const urls = aliasUrls(url);
+  const primary = urls[0];
+  if (seen.has(primary)) return;
+  seen.add(primary);
+
+  const schema = await getSchemaJson(primary);
+
+  // Add by $id (canonical)
+  if (schema?.$id) {
+    for (const a of aliasUrls(schema.$id)) {
+      try { ajv.addSchema(schema, a); } catch {}
+    }
+  }
+
+  // Add by requested URL(s) too (so Ajv can resolve by raw $ref URL)
+  for (const a of urls) {
+    try { ajv.addSchema(schema, a); } catch {}
+  }
+
+  // Recursively load refs
+  const refs = collectRefs(schema);
+
+  // only fetch absolute https refs (your schemas are absolute)
+  for (const r of refs) {
+    if (typeof r === "string" && r.startsWith("https://commandlayer.org/")) {
+      await ensureSchemaLoaded(r, seen);
+    } else if (typeof r === "string" && r.startsWith("https://www.commandlayer.org/")) {
+      await ensureSchemaLoaded(r, seen);
+    }
+  }
+}
+
 async function getReceiptValidatorForVerbSafe(verb) {
   if (validatorCache.has(verb)) return validatorCache.get(verb);
   if (inflight.has(verb)) return inflight.get(verb);
@@ -265,16 +277,12 @@ async function getReceiptValidatorForVerbSafe(verb) {
   const p = (async () => {
     const url = receiptSchemaUrlForVerb(verb);
 
-    // fetch within budget
-    const schema = await getSchemaJson(url);
+    // preload root + all refs (receipt.base, x402, etc.)
+    const seen = new Set();
+    await ensureSchemaLoaded(url, seen);
 
-    // Add the root schema under its $id so $ref can match if needed
-    if (schema?.$id) {
-      try { ajv.addSchema(schema, schema.$id); } catch {}
-    }
-
-    // compile synchronously — cannot hang
-    const validate = ajv.compile(schema);
+    const root = await getSchemaJson(url);
+    const validate = ajv.compile(root);
 
     validatorCache.set(verb, validate);
     inflight.delete(verb);
@@ -288,7 +296,7 @@ async function getReceiptValidatorForVerbSafe(verb) {
   return p;
 }
 
-// ---- health/debug
+// ---- debug
 
 app.get("/health", (req, res) => res.status(200).send("ok"));
 
@@ -307,7 +315,6 @@ app.get("/debug/env", (req, res) => {
     ens_pubkey_text_key: ENS_PUBKEY_TEXT_KEY,
     has_rpc: !!ETH_RPC_URL,
     schema_host: SCHEMA_HOST,
-    schema_cache_ttl_ms: SCHEMA_CACHE_TTL_MS,
     schema_fetch_timeout_ms: SCHEMA_FETCH_TIMEOUT_MS,
     schema_validate_budget_ms: SCHEMA_VALIDATE_BUDGET_MS,
   });
@@ -316,7 +323,7 @@ app.get("/debug/env", (req, res) => {
 app.get("/debug/enskey", async (req, res) => {
   const refresh = String(req.query.refresh || "") === "1";
   const out = await resolveEnsPubkeyPem({ refresh });
-  const preview = out.pem ? out.pem.slice(0, 80) + "..." : null;
+  const preview = out.pem ? out.pem.slice(0, 90) + "..." : null;
   res.json({
     ok: true,
     pubkey_source: out.source,
@@ -332,10 +339,7 @@ app.get("/debug/enskey", async (req, res) => {
 });
 
 app.get("/debug/validators", (req, res) => {
-  res.json({
-    ok: true,
-    cached: Array.from(validatorCache.keys()).map((verb) => ({ verb })),
-  });
+  res.json({ ok: true, cached: Array.from(validatorCache.keys()).map((verb) => ({ verb })) });
 });
 
 app.get("/debug/schemafetch", async (req, res) => {
@@ -344,34 +348,13 @@ app.get("/debug/schemafetch", async (req, res) => {
   const url = receiptSchemaUrlForVerb(verb);
   try {
     const schema = await getSchemaJson(url);
-    res.json({ ok: true, url, id: schema?.$id || null, hasRefs: !!schema?.allOf || !!schema?.$ref });
+    res.json({ ok: true, url, id: schema?.$id || null, hasRefs: collectRefs(schema).length > 0 });
   } catch (e) {
     res.status(500).json({ ok: false, url, error: e?.message || "fetch failed" });
   }
 });
 
-// ---- verbs (same as before, trimmed here to keep focus)
-// IMPORTANT: Keep your existing verb handlers as-is in your repo.
-// If you want, I’ll re-expand them, but you already have them working.
-
-const handlers = {}; // placeholder so file parses if you paste only this block
-// --- YOU ALREADY HAVE WORKING handlers in your current file ---
-// Don't delete them. Keep your current verb implementations.
-// The only section that matters for this fix is /verify schema=1 safe mode.
-
-function enabled(verb) {
-  return ENABLED_VERBS.includes(verb);
-}
-
-function requireBody(req, res) {
-  if (!req.body || typeof req.body !== "object") {
-    res.status(400).json(makeError(400, "Invalid JSON body"));
-    return false;
-  }
-  return true;
-}
-
-// ---- VERIFY
+// ---- verify
 
 app.post("/verify", async (req, res) => {
   try {
@@ -382,15 +365,7 @@ app.post("/verify", async (req, res) => {
       return res.status(400).json({
         ok: false,
         checks: { schema_valid: false, hash_matches: false, signature_valid: false },
-        values: {
-          verb: null,
-          signer_id: null,
-          alg: null,
-          canonical: null,
-          claimed_hash: null,
-          recomputed_hash: null,
-          pubkey_source: null,
-        },
+        values: { verb: null, signer_id: null, alg: null, canonical: null, claimed_hash: null, recomputed_hash: null, pubkey_source: null },
         errors: { schema_errors: null, signature_error: "missing signature/hash" },
         error: "missing metadata.proof.signature_b64 or hash_sha256",
       });
@@ -441,7 +416,6 @@ app.post("/verify", async (req, res) => {
     let schemaErrors = null;
 
     if (wantSchema) {
-      // HARD BUDGET so this NEVER causes 502
       try {
         await withTimeoutPromise(
           (async () => {
@@ -473,11 +447,7 @@ app.post("/verify", async (req, res) => {
 
     return res.json({
       ok: hashMatches && sigOk && schemaValid,
-      checks: {
-        schema_valid: schemaValid,
-        hash_matches: hashMatches,
-        signature_valid: sigOk,
-      },
+      checks: { schema_valid: schemaValid, hash_matches: hashMatches, signature_valid: sigOk },
       values: {
         verb: receipt?.x402?.verb ?? null,
         signer_id: proof.signer_id ?? null,
@@ -487,16 +457,11 @@ app.post("/verify", async (req, res) => {
         recomputed_hash: recomputed,
         pubkey_source: pubSrc,
       },
-      errors: {
-        schema_errors: schemaErrors,
-        signature_error: signatureError,
-      },
+      errors: { schema_errors: schemaErrors, signature_error: signatureError },
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || "verify failed" });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`runtime listening on :${PORT}`);
-});
+app.listen(PORT, () => console.log(`runtime listening on :${PORT}`));
