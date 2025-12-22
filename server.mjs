@@ -48,13 +48,53 @@ const SCHEMA_CACHE_TTL_MS = Number(
   process.env.SCHEMA_CACHE_TTL_MS || 10 * 60 * 1000
 );
 
+function normalizeSchemaUrl(uri) {
+  if (!uri || typeof uri !== "string") return uri;
+  // Avoid Vercel 307 redirect from commandlayer.org -> www.commandlayer.org
+  return uri.replace(
+    "https://commandlayer.org/",
+    "https://www.commandlayer.org/"
+  );
+}
+
 const ajv = new Ajv({
   strict: true,
   allErrors: true,
   loadSchema: async (uri) => {
-    const r = await fetch(uri, { method: "GET" });
-    if (!r.ok) throw new Error(`schema fetch failed ${r.status} for ${uri}`);
-    return await r.json();
+    const fixed = normalizeSchemaUrl(uri);
+
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 8000); // hard timeout: 8s
+    try {
+      const r = await fetch(fixed, {
+        method: "GET",
+        redirect: "follow",
+        signal: ctrl.signal,
+        headers: { accept: "application/json" },
+      });
+
+      if (!r.ok) throw new Error(`schema fetch failed ${r.status} for ${fixed}`);
+
+      const text = await r.text();
+
+      // Defensive: reject HTML/"Redirecting..." bodies that would break JSON.parse
+      const trimmed = text.trim();
+      if (
+        trimmed.startsWith("Redirecting") ||
+        trimmed.startsWith("<!DOCTYPE html") ||
+        trimmed.startsWith("<html")
+      ) {
+        throw new Error(`schema fetch returned non-JSON for ${fixed}`);
+      }
+
+      return JSON.parse(text);
+    } catch (e) {
+      if (e?.name === "AbortError")
+        throw new Error(`schema fetch timeout for ${fixed}`);
+      throw e;
+    } finally {
+      clearTimeout(t);
+    }
   },
 });
 addFormats(ajv);
@@ -155,7 +195,6 @@ function signEd25519Base64(messageUtf8) {
   const pem = pemFromB64(PRIV_PEM_B64);
   if (!pem) throw new Error("Missing RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64");
   const key = crypto.createPrivateKey(pem);
-  // For Ed25519: algorithm is null
   const sig = crypto.sign(null, Buffer.from(messageUtf8, "utf8"), key);
   return sig.toString("base64");
 }
@@ -187,7 +226,6 @@ function makeReceipt({ x402, trace, result }) {
     },
   };
 
-  // hash/sign after building receipt but BEFORE inserting signature/hash
   const unsigned = structuredClone(receipt);
   unsigned.metadata.proof.hash_sha256 = "";
   unsigned.metadata.proof.signature_b64 = "";
@@ -208,7 +246,8 @@ function makeError(code, message, extra = {}) {
 
 // ---- AJV helpers
 function receiptSchemaIdForVerb(verb) {
-  return `https://commandlayer.org/schemas/v1.0.0/commons/${verb}/receipts/${verb}.receipt.schema.json`;
+  // Use www to avoid Vercel redirect chains
+  return `https://www.commandlayer.org/schemas/v1.0.0/commons/${verb}/receipts/${verb}.receipt.schema.json`;
 }
 
 async function getReceiptValidator(verb) {
@@ -217,7 +256,6 @@ async function getReceiptValidator(verb) {
   const cached = validatorCache.get(schemaId);
   if (cached && now - cached.fetchedAt < SCHEMA_CACHE_TTL_MS) return cached.validate;
 
-  // compileAsync uses loadSchema to fetch + resolve $refs
   const validate = await ajv.compileAsync({ $ref: schemaId });
 
   validatorCache.set(schemaId, { validate, fetchedAt: now });
@@ -531,7 +569,9 @@ function doConvert(body) {
       throw new Error("convert json->csv supports only flat JSON objects");
     }
   } else {
-    warnings.push(`No deterministic converter for ${src}->${tgt}; echoing content.`);
+    warnings.push(
+      `No deterministic converter for ${src}->${tgt}; echoing content.`
+    );
   }
 
   return {
@@ -581,16 +621,17 @@ function doExplain(body) {
   const result = { explanation };
 
   if (detail !== "short" || style === "step-by-step") result.steps = steps;
-  result.summary = "Receipts are evidence, not logs: validate schema + hash + signature.";
+  result.summary =
+    "Receipts are evidence, not logs: validate schema + hash + signature.";
   result.references = [
-    "https://commandlayer.org/schemas/v1.0.0/_shared/receipt.base.schema.json",
-    "https://commandlayer.org/schemas/v1.0.0/_shared/x402.schema.json",
+    "https://www.commandlayer.org/schemas/v1.0.0/_shared/receipt.base.schema.json",
+    "https://www.commandlayer.org/schemas/v1.0.0/_shared/x402.schema.json",
   ];
 
   return result;
 }
 
-// ---- analyze (schema expects body.input string, not body.input.content)
+// ---- analyze / classify helpers
 function clamp01(n) {
   if (Number.isNaN(n)) return 0;
   if (n < 0) return 0;
@@ -609,6 +650,7 @@ function topNByCount(counts, n) {
     .map(([k]) => k);
 }
 
+// ---- analyze (schema expects body.input string, not body.input.content)
 function doAnalyze(body) {
   const inputText = String(body?.input ?? "").trim();
   if (!inputText) throw new Error("analyze.input required (string)");
@@ -631,12 +673,12 @@ function doAnalyze(body) {
 
   let score = 0;
   score += Math.min(0.25, words.length / 800);
-  score += Math.min(0.20, nonEmptyLines.length / 120);
+  score += Math.min(0.2, nonEmptyLines.length / 120);
   score += hasJsonLike ? 0.15 : 0;
-  score += hasNumbers ? 0.10 : 0;
+  score += hasNumbers ? 0.1 : 0;
   score += hasUrl ? 0.05 : 0;
   score += hasEmail ? 0.05 : 0;
-  score += hasCodeFence ? 0.10 : 0;
+  score += hasCodeFence ? 0.1 : 0;
   score = clamp01(score);
 
   const insights = [];
@@ -767,8 +809,8 @@ function doClassify(body) {
       let boost = 0;
       if (label === "structured" && hasJsonLike) boost += 0.35;
       if (label === "code_or_logs" && (hasCodeFence || hasErrorWords)) boost += 0.35;
-      if (label === "contains_urls" && hasUrl) boost += 0.50;
-      if (label === "contains_emails" && hasEmail) boost += 0.50;
+      if (label === "contains_urls" && hasUrl) boost += 0.5;
+      if (label === "contains_emails" && hasEmail) boost += 0.5;
 
       const score = clamp01(overlap * 0.7 + boost);
       return { label, score };
@@ -844,7 +886,6 @@ async function handleVerb(verb, req, res) {
         entry: `x402://${verb}agent.eth/${verb}/v1.0.0`,
       };
 
-    // enforce a hard timeout if caller asks
     const timeoutMs = Number(
       req.body?.limits?.timeout_ms || req.body?.limits?.max_latency_ms || 0
     );
@@ -905,7 +946,7 @@ app.post("/verify", async (req, res) => {
 
     const verb = receipt?.x402?.verb ?? null;
 
-    // ---- schema validation (AJV)
+    // ---- schema validation (AJV) — never hang due to www+timeout in loadSchema
     let schemaValid = false;
     let schemaErrors = null;
 
