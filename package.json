@@ -1,6 +1,7 @@
 {
-  "name": "cl-fetch-live",
+  "name": "@commandlayer/runtime",
   "version": "1.0.0",
+  "private": true,
   "type": "module",
   "scripts": {
     "start": "node server.mjs"
@@ -8,10 +9,8 @@
   "dependencies": {
     "ajv": "^8.0.0",
     "ajv-formats": "^3.0.0",
-    "cors": "^2.8.5",
     "ethers": "^6.16.0",
     "express": "^4.18.0",
-    "node-fetch": "^3.3.2",
-    "viem": "^2.0.0"
+    "node-fetch": "^3.3.2"
   }
 }
