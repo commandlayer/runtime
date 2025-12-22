@@ -1,9 +1,10 @@
 // server.mjs
 import express from "express";
 import crypto from "crypto";
+import fetch from "node-fetch";
 import Ajv from "ajv";
 import addFormats from "ajv-formats";
-import { Resolver, namehash, dnsEncode } from "ethers";
+import { JsonRpcProvider } from "ethers";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -19,33 +20,43 @@ app.use((req, res, next) => {
 
 const PORT = Number(process.env.PORT || 8080);
 
-// ------------------- config -------------------
 const ENABLED_VERBS = (process.env.ENABLED_VERBS || "fetch")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-const SIGNER_ID = process.env.RECEIPT_SIGNER_ID || process.env.ENS_NAME || "runtime";
+const SIGNER_ID =
+  process.env.RECEIPT_SIGNER_ID || process.env.ENS_NAME || "runtime";
 
 const PRIV_PEM_B64 = process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64 || "";
 const PUB_PEM_B64 = process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "";
 
-const VERIFIER_ENS_NAME = process.env.VERIFIER_ENS_NAME || SIGNER_ID;
-const ENS_PUBKEY_TEXT_KEY = process.env.ENS_PUBKEY_TEXT_KEY || "cl.receipt.pubkey.pem";
+const VERIFIER_ENS_NAME =
+  process.env.VERIFIER_ENS_NAME || process.env.ENS_NAME || SIGNER_ID;
+
+const ENS_PUBKEY_TEXT_KEY =
+  process.env.ENS_PUBKEY_TEXT_KEY || "cl.receipt.pubkey.pem";
 
 const ETH_RPC_URL = process.env.ETH_RPC_URL || "";
 
+// Use the canonical host that avoids your 307 issues
 const SCHEMA_HOST = process.env.SCHEMA_HOST || "https://www.commandlayer.org";
-const SCHEMA_FETCH_TIMEOUT_MS = Number(process.env.SCHEMA_FETCH_TIMEOUT_MS || 8000);
-const AJV_COMPILE_TIMEOUT_MS = Number(process.env.AJV_COMPILE_TIMEOUT_MS || 12000);
-const VERIFY_OVERALL_TIMEOUT_MS = Number(process.env.VERIFY_OVERALL_TIMEOUT_MS || 12000);
 
-const ENS_CACHE_TTL_MS = Number(process.env.ENS_CACHE_TTL_MS || 10 * 60 * 1000);
+const ENS_CACHE_TTL_MS = Number(process.env.ENS_CACHE_TTL_MS || 600_000);
+const SCHEMA_CACHE_TTL_MS = Number(process.env.SCHEMA_CACHE_TTL_MS || 600_000);
 
-// ------------------- utils -------------------
+// Tight timeouts so /verify never hangs
+const SCHEMA_FETCH_TIMEOUT_MS = Number(
+  process.env.SCHEMA_FETCH_TIMEOUT_MS || 8000
+);
+const AJV_COMPILE_TIMEOUT_MS = Number(
+  process.env.AJV_COMPILE_TIMEOUT_MS || 12000
+);
+
 function nowIso() {
   return new Date().toISOString();
 }
+
 function randId(prefix = "trace_") {
   return prefix + crypto.randomBytes(6).toString("hex");
 }
@@ -77,51 +88,39 @@ function pemFromB64(b64) {
   return pem.includes("BEGIN") ? pem : null;
 }
 
+// Handle ENS TXT values that contain literal "\n"
 function normalizePem(maybePem) {
   if (!maybePem) return null;
   let s = String(maybePem).trim();
-
-  // If TXT record stored with literal "\n", convert to real newlines
-  s = s.replace(/\\n/g, "\n");
-
-  // Sometimes people paste with surrounding quotes
-  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+  s = s.replace(/\\n/g, "\n"); // convert literal \n into real newlines
+  // strip accidental wrapping quotes
+  if (
+    (s.startsWith('"') && s.endsWith('"')) ||
+    (s.startsWith("'") && s.endsWith("'"))
+  ) {
     s = s.slice(1, -1).trim();
   }
-
-  // Ensure it looks like a PEM public key
   if (!s.includes("BEGIN PUBLIC KEY")) return null;
   return s;
 }
 
-// Hard timeout wrapper that never hangs the request
-async function withTimeout(promise, ms, label = "timeout") {
-  const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(label), ms);
-  try {
-    // If promise supports abort, it can read ac.signal; if not, still times out via race
-    return await Promise.race([
-      promise,
-      new Promise((_, rej) => setTimeout(() => rej(new Error(label)), ms)),
-    ]);
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-// ------------------- signing / verifying -------------------
 function signEd25519Base64(messageUtf8) {
   const pem = pemFromB64(PRIV_PEM_B64);
   if (!pem) throw new Error("Missing RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64");
   const key = crypto.createPrivateKey(pem);
-  // For Ed25519: algorithm is null
-  const sig = crypto.sign(null, Buffer.from(messageUtf8, "utf8"), key);
+  const sig = crypto.sign(null, Buffer.from(messageUtf8, "utf8"), key); // Ed25519 -> null
   return sig.toString("base64");
 }
 
 function verifyEd25519Base64(messageUtf8, signatureB64, pubPem) {
-  const key = crypto.createPublicKey(pubPem);
-  return crypto.verify(null, Buffer.from(messageUtf8, "utf8"), key, Buffer.from(signatureB64, "base64"));
+  const normalized = normalizePem(pubPem) || pubPem;
+  const key = crypto.createPublicKey(normalized);
+  return crypto.verify(
+    null,
+    Buffer.from(messageUtf8, "utf8"),
+    key,
+    Buffer.from(signatureB64, "base64")
+  );
 }
 
 function makeReceipt({ x402, trace, result }) {
@@ -141,7 +140,6 @@ function makeReceipt({ x402, trace, result }) {
     },
   };
 
-  // hash/sign after building receipt but BEFORE inserting signature/hash
   const unsigned = structuredClone(receipt);
   unsigned.metadata.proof.hash_sha256 = "";
   unsigned.metadata.proof.signature_b64 = "";
@@ -160,17 +158,29 @@ function makeError(code, message, extra = {}) {
   return { status: "error", code, message, ...extra };
 }
 
-// ------------------- ENS pubkey resolve (ethers v6) -------------------
+// -------------------- ENS PUBKEY RESOLUTION (ethers v6 correct)
+
 const ensCache = {
   fetched_at: null,
+  ttl_ms: ENS_CACHE_TTL_MS,
   value_pem: null,
   error: null,
 };
 
 async function resolveEnsPubkeyPem({ refresh = false } = {}) {
   const now = Date.now();
-  if (!refresh && ensCache.fetched_at && now - ensCache.fetched_at < ENS_CACHE_TTL_MS) {
-    return { ok: !!ensCache.value_pem, pem: ensCache.value_pem, source: "ens-cache", error: ensCache.error };
+  if (
+    !refresh &&
+    ensCache.fetched_at &&
+    now - ensCache.fetched_at < ENS_CACHE_TTL_MS
+  ) {
+    return {
+      ok: !!ensCache.value_pem,
+      pem: ensCache.value_pem,
+      source: "ens-cache",
+      error: ensCache.error,
+      fetched_at: ensCache.fetched_at,
+    };
   }
 
   if (!ETH_RPC_URL) {
@@ -181,129 +191,111 @@ async function resolveEnsPubkeyPem({ refresh = false } = {}) {
   }
 
   try {
-    const resolver = new Resolver({ url: ETH_RPC_URL });
+    const provider = new JsonRpcProvider(ETH_RPC_URL);
 
-    // ENS Text records are stored via ENS resolver. ethers v6: resolver.getText(name, key)
-    const txt = await withTimeout(
-      resolver.getText(VERIFIER_ENS_NAME, ENS_PUBKEY_TEXT_KEY),
-      6000,
-      "ens_txt_timeout"
-    );
+    const resolver = await provider.getResolver(VERIFIER_ENS_NAME);
+    if (!resolver) throw new Error(`No ENS resolver for ${VERIFIER_ENS_NAME}`);
 
+    const txt = await resolver.getText(ENS_PUBKEY_TEXT_KEY);
     const pem = normalizePem(txt);
 
     ensCache.fetched_at = now;
     ensCache.value_pem = pem;
-    ensCache.error = pem ? null : `TXT ${ENS_PUBKEY_TEXT_KEY} missing/invalid PEM`;
-    return { ok: !!pem, pem, source: "ens", error: ensCache.error };
+    ensCache.error = pem ? null : `TXT missing/invalid PEM for ${ENS_PUBKEY_TEXT_KEY}`;
+
+    return { ok: !!pem, pem, source: "ens", error: ensCache.error, fetched_at: now };
   } catch (e) {
     ensCache.fetched_at = now;
     ensCache.value_pem = null;
     ensCache.error = e?.message || "ENS lookup failed";
-    return { ok: false, pem: null, source: "ens", error: ensCache.error };
+    return { ok: false, pem: null, source: "ens", error: ensCache.error, fetched_at: now };
   }
 }
 
-app.get("/debug/enskey", async (req, res) => {
-  const refresh = req.query.refresh === "1";
-  const r = await resolveEnsPubkeyPem({ refresh });
-  const preview = r.pem ? (r.pem.slice(0, 80) + "...") : null;
+// -------------------- AJV (optional verify-time schema validation)
 
-  res.json({
-    ok: true,
-    pubkey_source: r.source,
-    ens_name: VERIFIER_ENS_NAME,
-    txt_key: ENS_PUBKEY_TEXT_KEY,
-    cache: {
-      fetched_at: ensCache.fetched_at ? new Date(ensCache.fetched_at).toISOString() : null,
-      ttl_ms: ENS_CACHE_TTL_MS,
+const schemaCache = new Map(); // url -> { fetched_at, json }
+const validatorCache = new Map(); // verb -> { compiled_at, validateFn }
+const inflightCompile = new Map(); // verb -> Promise
+
+function withTimeout(promise, ms, label = "timeout") {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), ms);
+  const raced = Promise.race([
+    promise(controller.signal),
+    new Promise((_, rej) => setTimeout(() => rej(new Error(label)), ms)),
+  ]);
+  raced.finally(() => clearTimeout(t));
+  return raced;
+}
+
+async function fetchJson(url) {
+  const now = Date.now();
+  const cached = schemaCache.get(url);
+  if (cached && now - cached.fetched_at < SCHEMA_CACHE_TTL_MS) return cached.json;
+
+  const json = await withTimeout(
+    async (signal) => {
+      const r = await fetch(url, { method: "GET", signal });
+      if (!r.ok) throw new Error(`schema fetch failed ${r.status} for ${url}`);
+      return r.json();
     },
-    preview,
-    error: r.error,
-  });
-});
+    SCHEMA_FETCH_TIMEOUT_MS,
+    `schema_fetch_timeout ${SCHEMA_FETCH_TIMEOUT_MS}ms`
+  );
 
-// ------------------- AJV schema validation (compile on demand) -------------------
+  schemaCache.set(url, { fetched_at: now, json });
+  return json;
+}
+
+// AJV instance with remote ref loading
 const ajv = new Ajv({
   strict: false,
   allErrors: true,
   loadSchema: async (uri) => {
-    const url = rewriteSchemaUrl(uri);
-    const body = await fetchJsonWithTimeout(url, SCHEMA_FETCH_TIMEOUT_MS);
-    return body;
+    // Normalize any non-www host to www host (your redirects were biting you)
+    const fixed = String(uri).replace(/^https:\/\/commandlayer\.org\//, `${SCHEMA_HOST}/`);
+    return fetchJson(fixed);
   },
 });
 addFormats(ajv);
 
-function rewriteSchemaUrl(uri) {
-  // Your schemas redirect commandlayer.org -> www.commandlayer.org.
-  // We normalize to SCHEMA_HOST so AJV fetches the final host directly.
-  if (!uri || typeof uri !== "string") return uri;
-  if (uri.startsWith("https://commandlayer.org/")) return uri.replace("https://commandlayer.org", SCHEMA_HOST);
-  if (uri.startsWith("http://commandlayer.org/")) return uri.replace("http://commandlayer.org", SCHEMA_HOST);
-  if (uri.startsWith("https://www.commandlayer.org/")) return uri.replace("https://www.commandlayer.org", SCHEMA_HOST);
-  return uri;
-}
-
-async function fetchJsonWithTimeout(url, timeoutMs) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort("fetch_timeout"), timeoutMs);
-  try {
-    const resp = await fetch(url, { method: "GET", signal: controller.signal });
-    if (!resp.ok) throw new Error(`fetch failed ${resp.status} ${resp.statusText} for ${url}`);
-    return await resp.json();
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-const validatorCache = new Map();       // key -> validateFn
-const inflightCompiles = new Map();     // key -> Promise<validateFn>
-
 function receiptSchemaUrlForVerb(verb) {
-  // verb receipt schema path pattern (your site):
-  // https://www.commandlayer.org/schemas/v1.0.0/commons/<verb>/receipts/<verb>.receipt.schema.json
+  // commons only for now
   return `${SCHEMA_HOST}/schemas/v1.0.0/commons/${verb}/receipts/${verb}.receipt.schema.json`;
 }
 
-async function getReceiptValidator(verb) {
-  const key = `receipt:${verb}:v1.0.0`;
+async function getReceiptValidatorForVerb(verb) {
+  const cached = validatorCache.get(verb);
+  if (cached) return cached.validateFn;
 
-  if (validatorCache.has(key)) return validatorCache.get(key);
-
-  if (inflightCompiles.has(key)) return inflightCompiles.get(key);
+  if (inflightCompile.has(verb)) return inflightCompile.get(verb);
 
   const p = (async () => {
     const schemaUrl = receiptSchemaUrlForVerb(verb);
 
-    // compileAsync can hang if the network stalls; hard-time it.
-    const validate = await withTimeout(
-      ajv.compileAsync({ $ref: schemaUrl }),
+    const validateFn = await withTimeout(
+      async () => {
+        // compileAsync will pull remote refs via loadSchema
+        return ajv.compileAsync({ $ref: schemaUrl });
+      },
       AJV_COMPILE_TIMEOUT_MS,
-      "ajv_compile_timeout"
+      `ajv_compile_timeout ${AJV_COMPILE_TIMEOUT_MS}ms`
     );
 
-    validatorCache.set(key, validate);
-    inflightCompiles.delete(key);
-    return validate;
+    validatorCache.set(verb, { compiled_at: Date.now(), validateFn });
+    inflightCompile.delete(verb);
+    return validateFn;
   })().catch((e) => {
-    inflightCompiles.delete(key);
+    inflightCompile.delete(verb);
     throw e;
   });
 
-  inflightCompiles.set(key, p);
+  inflightCompile.set(verb, p);
   return p;
 }
 
-app.get("/debug/validators", (req, res) => {
-  res.json({
-    ok: true,
-    cached: Array.from(validatorCache.keys()),
-    inflight: Array.from(inflightCompiles.keys()),
-  });
-});
-
-// ------------------- health/debug -------------------
+// ---- health/debug
 app.get("/health", (req, res) => res.status(200).send("ok"));
 
 app.get("/debug/env", (req, res) => {
@@ -320,15 +312,38 @@ app.get("/debug/env", (req, res) => {
     verifier_ens_name: VERIFIER_ENS_NAME,
     ens_pubkey_text_key: ENS_PUBKEY_TEXT_KEY,
     has_rpc: !!ETH_RPC_URL,
-    schema_cache_ttl_ms: ENS_CACHE_TTL_MS,
     schema_host: SCHEMA_HOST,
+    schema_cache_ttl_ms: SCHEMA_CACHE_TTL_MS,
     schema_fetch_timeout_ms: SCHEMA_FETCH_TIMEOUT_MS,
     ajv_compile_timeout_ms: AJV_COMPILE_TIMEOUT_MS,
-    verify_overall_timeout_ms: VERIFY_OVERALL_TIMEOUT_MS,
   });
 });
 
-// ------------------- verb implementations -------------------
+app.get("/debug/enskey", async (req, res) => {
+  const refresh = String(req.query.refresh || "") === "1";
+  const out = await resolveEnsPubkeyPem({ refresh });
+  const preview = out.pem ? out.pem.slice(0, 80) + "..." : null;
+  res.json({
+    ok: true,
+    pubkey_source: out.source,
+    ens_name: VERIFIER_ENS_NAME,
+    txt_key: ENS_PUBKEY_TEXT_KEY,
+    cache: { fetched_at: out.fetched_at ? new Date(out.fetched_at).toISOString() : null, ttl_ms: ENS_CACHE_TTL_MS },
+    preview,
+    error: out.error || null,
+  });
+});
+
+app.get("/debug/validators", (req, res) => {
+  const cached = [];
+  for (const [verb, v] of validatorCache.entries()) {
+    cached.push({ verb, compiled_at: new Date(v.compiled_at).toISOString() });
+  }
+  res.json({ ok: true, cached });
+});
+
+// ---- deterministic verb implementations
+
 async function doFetch(body) {
   const url = body?.source || body?.input?.source || body?.input?.url;
   if (!url || typeof url !== "string") throw new Error("fetch requires source (url)");
@@ -469,7 +484,7 @@ function doParse(body) {
     try {
       parsed = JSON.parse(content);
       confidence = 0.98;
-    } catch (e) {
+    } catch {
       if (mode === "strict") throw new Error("invalid json");
       warnings.push("Invalid JSON; returned empty object in best_effort.");
       parsed = {};
@@ -605,7 +620,6 @@ function doExplain(body) {
 
   const result = { explanation };
   if (detail !== "short" || style === "step-by-step") result.steps = steps;
-
   result.summary = "Receipts are evidence, not logs: validate schema + hash + signature.";
   result.references = [
     `${SCHEMA_HOST}/schemas/v1.0.0/_shared/receipt.base.schema.json`,
@@ -616,89 +630,79 @@ function doExplain(body) {
 }
 
 function doAnalyze(body) {
-  const input = String(body?.input ?? "").trim();
+  const inputText = String(body?.input ?? "").trim();
+  if (!inputText) throw new Error("analyze.input (string) required");
   const goal = String(body?.goal ?? "").trim();
-  const hints = Array.isArray(body?.hints) ? body.hints.map((s) => String(s)) : [];
-  if (!input) throw new Error("analyze.input required (string)");
 
-  const words = input.split(/\s+/).filter(Boolean);
-  const lines = input.split(/\r?\n/).filter((l) => l.trim() !== "");
+  const lines = inputText.split(/\r?\n/).filter((l) => l.trim() !== "");
+  const words = inputText.split(/\s+/).filter(Boolean);
 
-  const hasUrl = /https?:\/\/\S+/i.test(input);
-  const hasEmail = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(input);
-  const hasJsonish = /[{[\]]/.test(input);
-  const hasNums = /\d/.test(input);
+  const hasUrl = /https?:\/\/\S+/i.test(inputText);
+  const hasEmail = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(inputText);
+  const hasNumber = /\b\d+(\.\d+)?\b/.test(inputText);
+  const looksJson = /[{[\]]/.test(inputText);
 
   const labels = [];
-  if (hasJsonish) labels.push("structured");
+  if (looksJson) labels.push("structured");
   if (hasUrl) labels.push("contains_urls");
   if (hasEmail) labels.push("contains_emails");
-  if (labels.length === 0) labels.push("unstructured");
+
+  let score = 0;
+  if (hasUrl) score += 0.2;
+  if (hasEmail) score += 0.25;
+  if (looksJson) score += 0.1;
+  if (hasNumber) score += 0.05;
+  score = Math.max(0, Math.min(1, Number(score.toFixed(3))));
 
   const topTerms = words
-    .map((w) => w.toLowerCase().replace(/[^a-z0-9._/-]/g, ""))
-    .filter(Boolean)
-    .slice(0, 12);
-
-  const score =
-    Math.min(
-      1,
-      (labels.includes("structured") ? 0.25 : 0) +
-        (hasUrl ? 0.15 : 0) +
-        (hasEmail ? 0.25 : 0) +
-        (hasNums ? 0.10 : 0) +
-        (Math.min(words.length, 40) / 40) * 0.25
-    ) || 0;
+    .slice(0, 32)
+    .map((w) => w.toLowerCase().replace(/[^\w.@:/-]+/g, ""))
+    .filter(Boolean);
 
   const insights = [
-    `Input length: ${input.length} chars; ~${words.length} words; ${lines.length} non-empty lines.`,
+    `Input length: ${inputText.length} chars; ~${words.length} words; ${lines.length} non-empty lines.`,
     goal ? `Goal: ${goal}` : "Goal: (none)",
-    `Hints provided: ${hints.length}.`,
-    hasJsonish ? "Content appears to include JSON/structured data markers." : "No obvious structured markers.",
-    hasUrl ? "Content includes URL(s)." : "No URLs detected.",
-    hasEmail ? "Content includes email-like strings." : "No emails detected.",
-    hasNums ? "Content includes numeric values." : "No numbers detected.",
-    `Top terms: ${topTerms.join(", ") || "(none)"}`,
+    `Hints provided: ${Array.isArray(body?.hints) ? body.hints.length : 0}.`,
+    looksJson ? "Content appears to include JSON/structured data markers." : "No strong structured-data markers detected.",
+    hasUrl ? "Content includes URL(s)." : "No URL detected.",
+    hasEmail ? "Content includes email-like strings." : "No email-like strings detected.",
+    hasNumber ? "Content includes numeric values." : "No numeric values detected.",
+    `Top terms: ${topTerms.slice(0, 12).join(", ") || "(none)"}`,
   ];
 
-  return {
-    summary: `Deterministic analysis: ${labels.join(", ")}. Goal="${goal || "(none)"}". Score=${Number(score.toFixed(3))}.`,
-    insights,
-    labels,
-    score: Number(score.toFixed(3)),
-  };
+  const summary = `Deterministic analysis: ${labels.join(", ") || "no_flags"}. ${goal ? `Goal="${goal}". ` : ""}Score=${score}.`;
+
+  return { summary, insights, labels, score };
 }
 
 function doClassify(body) {
-  const content = String(body?.input?.content ?? "").trim();
-  const maxLabels = Number(body?.limits?.max_labels || 5);
+  const input = body?.input || {};
+  const content = String(input.content ?? "").trim();
   if (!content) throw new Error("classify.input.content required");
+
+  const maxLabels = Number(body?.limits?.max_labels ?? 5);
+  const hasUrl = /https?:\/\/\S+/i.test(content);
+  const hasEmail = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(content);
+  const looksCode = /(error:|stack|trace|cannot get|exception)/i.test(content);
 
   const labels = [];
   const scores = [];
-  const taxonomy = ["root"];
 
-  const hasUrl = /https?:\/\/\S+/i.test(content);
-  const hasEmail = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(content);
-  const looksLikeLogs = /(error|exception|stack|trace|cannot get)/i.test(content);
-
-  if (hasUrl) { labels.push("contains_urls"); scores.push(0.7333333333333333); taxonomy.push("contains_urls"); }
-  if (hasEmail) { labels.push("contains_emails"); scores.push(0.5); }
-  if (looksLikeLogs) { labels.push("code_or_logs"); scores.push(0.4375); }
-
-  // keep deterministic fillers so schema always has at least 1 label
-  const fillers = ["general", "finance"];
-  for (const f of fillers) {
-    if (labels.length >= maxLabels) break;
-    labels.push(f);
-    scores.push(0);
-  }
-
-  return {
-    labels: labels.slice(0, maxLabels),
-    scores: scores.slice(0, maxLabels),
-    taxonomy: taxonomy.slice(0, maxLabels),
+  const push = (label, score) => {
+    if (labels.length >= maxLabels) return;
+    labels.push(label);
+    scores.push(Number(score.toFixed(6)));
   };
+
+  if (hasUrl) push("contains_urls", 0.7333333333333333);
+  if (hasEmail) push("contains_emails", 0.5);
+  if (looksCode) push("code_or_logs", 0.4375);
+
+  // keep deterministic filler
+  push("general", labels.length ? 0 : 0.2);
+
+  const taxonomy = ["root", labels[0] || "general"];
+  return { labels, scores, taxonomy };
 }
 
 // Router: dispatch by verb
@@ -746,7 +750,10 @@ async function handleVerb(verb, req, res) {
     const timeoutMs = Number(req.body?.limits?.timeout_ms || req.body?.limits?.max_latency_ms || 0);
     const work = Promise.resolve(handlers[verb](req.body));
     const result = timeoutMs
-      ? await Promise.race([work, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), timeoutMs))])
+      ? await Promise.race([
+          work,
+          new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), timeoutMs)),
+        ])
       : await work;
 
     trace.completed_at = nowIso();
@@ -766,172 +773,122 @@ for (const v of Object.keys(handlers)) {
   app.post(`/${v}/v1.0.0`, (req, res) => handleVerb(v, req, res));
 }
 
-// ------------------- VERIFY -------------------
+// Verify endpoint: hash + signature, optionally ENS pubkey, optionally schema validation
 app.post("/verify", async (req, res) => {
-  const started = Date.now();
-  const schemaOn = req.query.schema === "1";
-  const ensOn = req.query.ens === "1";
-  const refreshEns = req.query.refresh === "1";
-  const fallback = req.query.fallback === "1";
-
   try {
-    // HARD overall request timeout guard (prevents Railway 502)
-    const out = await withTimeout(
-      (async () => {
-        const receipt = req.body;
-        const proof = receipt?.metadata?.proof;
+    const receipt = req.body;
+    const proof = receipt?.metadata?.proof;
 
-        if (!proof?.signature_b64 || !proof?.hash_sha256) {
-          return {
-            statusCode: 400,
-            body: {
-              ok: false,
-              checks: { schema_valid: false, hash_matches: false, signature_valid: false },
-              values: {
-                verb: null,
-                signer_id: null,
-                alg: null,
-                canonical: null,
-                claimed_hash: null,
-                recomputed_hash: null,
-                pubkey_source: null,
-              },
-              errors: { schema_errors: null, signature_error: "missing signature/hash" },
-              error: "missing metadata.proof.signature_b64 or hash_sha256",
-            },
-          };
-        }
+    if (!proof?.signature_b64 || !proof?.hash_sha256) {
+      return res.status(400).json({
+        ok: false,
+        checks: { schema_valid: false, hash_matches: false, signature_valid: false },
+        values: {
+          verb: null,
+          signer_id: null,
+          alg: null,
+          canonical: null,
+          claimed_hash: null,
+          recomputed_hash: null,
+          pubkey_source: null,
+        },
+        errors: { schema_errors: null, signature_error: "missing signature/hash" },
+        error: "missing metadata.proof.signature_b64 or hash_sha256",
+      });
+    }
 
-        // recompute hash from canonical unsigned receipt
-        const unsigned = structuredClone(receipt);
-        unsigned.metadata.proof.hash_sha256 = "";
-        unsigned.metadata.proof.signature_b64 = "";
-        const canonical = stableStringify(unsigned);
-        const recomputed = sha256Hex(canonical);
+    // recompute hash from canonical unsigned receipt
+    const unsigned = structuredClone(receipt);
+    unsigned.metadata.proof.hash_sha256 = "";
+    unsigned.metadata.proof.signature_b64 = "";
+    const canonical = stableStringify(unsigned);
+    const recomputed = sha256Hex(canonical);
+    const hashMatches = recomputed === proof.hash_sha256;
 
-        const hashMatches = recomputed === proof.hash_sha256;
+    // pubkey selection
+    const wantEns = String(req.query.ens || "") === "1";
+    const refreshEns = String(req.query.refresh || "") === "1";
 
-        // pubkey resolution
-        let pubPem = null;
-        let pubSrc = null;
-        let sigOk = false;
-        let sigErr = null;
+    let pubPem = null;
+    let pubSrc = null;
+    let sigOk = false;
+    let signatureError = null;
 
-        if (ensOn) {
-          const r = await resolveEnsPubkeyPem({ refresh: refreshEns });
-          if (r.ok) {
-            pubPem = r.pem;
-            pubSrc = "ens";
-          } else if (!fallback) {
-            return {
-              statusCode: 400,
-              body: {
-                ok: false,
-                checks: { schema_valid: false, hash_matches: hashMatches, signature_valid: false },
-                values: {
-                  verb: receipt?.x402?.verb ?? null,
-                  signer_id: proof.signer_id ?? null,
-                  alg: proof.alg ?? null,
-                  canonical: proof.canonical ?? null,
-                  claimed_hash: proof.hash_sha256 ?? null,
-                  recomputed_hash: recomputed,
-                  pubkey_source: "ens",
-                },
-                errors: { schema_errors: null, signature_error: r.error || "ENS pubkey unavailable" },
-                error: "ENS pubkey unavailable (set fallback=1 to allow env pubkey)",
-              },
-            };
-          }
-        }
-
-        if (!pubPem) {
-          const envPub = pemFromB64(PUB_PEM_B64);
-          if (envPub) {
-            pubPem = envPub;
-            pubSrc = "env-b64";
-          }
-        }
-
-        if (pubPem) {
-          try {
-            sigOk = verifyEd25519Base64(proof.hash_sha256, proof.signature_b64, pubPem);
-          } catch (e) {
-            sigOk = false;
-            sigErr = e?.message || "signature verify failed";
-          }
+    try {
+      if (wantEns) {
+        const out = await resolveEnsPubkeyPem({ refresh: refreshEns });
+        if (out.pem) {
+          pubPem = out.pem;
+          pubSrc = "ens";
         } else {
-          sigOk = false;
-          sigErr = "no public key available";
+          // ENS requested but missing -> treat as failure
+          pubPem = null;
+          pubSrc = "ens";
+          signatureError = out.error || "ENS pubkey missing";
         }
+      } else {
+        pubPem = pemFromB64(PUB_PEM_B64);
+        pubSrc = pubPem ? "env-b64" : null;
+      }
 
-        // schema validation (optional)
-        let schemaValid = true;
-        let schemaErrors = null;
+      if (pubPem) {
+        sigOk = verifyEd25519Base64(proof.hash_sha256, proof.signature_b64, pubPem);
+      } else {
+        sigOk = false;
+      }
+    } catch (e) {
+      sigOk = false;
+      signatureError = e?.message || "signature verify failed";
+    }
 
-        if (schemaOn) {
-          const verb = receipt?.x402?.verb;
-          if (!verb || typeof verb !== "string") {
-            schemaValid = false;
-            schemaErrors = [{ message: "missing receipt.x402.verb" }];
-          } else {
-            try {
-              const validate = await getReceiptValidator(verb);
-              schemaValid = !!validate(receipt);
-              schemaErrors = schemaValid ? null : (validate.errors || []).map((e) => ({
-                instancePath: e.instancePath,
-                schemaPath: e.schemaPath,
-                message: e.message,
-              }));
-            } catch (e) {
-              schemaValid = false;
-              schemaErrors = [{ message: e?.message || "schema validation failed" }];
-            }
-          }
-        }
+    // schema validation (OFF by default)
+    const wantSchema = String(req.query.schema || "") === "1";
+    let schemaValid = true;
+    let schemaErrors = null;
 
-        return {
-          statusCode: 200,
-          body: {
-            ok: schemaValid && hashMatches && sigOk,
-            checks: {
-              schema_valid: schemaValid,
-              hash_matches: hashMatches,
-              signature_valid: sigOk,
-            },
-            values: {
-              verb: receipt?.x402?.verb ?? null,
-              signer_id: proof.signer_id ?? null,
-              alg: proof.alg ?? null,
-              canonical: proof.canonical ?? null,
-              claimed_hash: proof.hash_sha256 ?? null,
-              recomputed_hash: recomputed,
-              pubkey_source: pubSrc,
-            },
-            errors: { schema_errors: schemaErrors, signature_error: sigErr },
-          },
-        };
-      })(),
-      VERIFY_OVERALL_TIMEOUT_MS,
-      "verify_overall_timeout"
-    );
+    if (wantSchema) {
+      try {
+        const verb = String(receipt?.x402?.verb || "").trim();
+        if (!verb) throw new Error("missing x402.verb");
+        const validate = await getReceiptValidatorForVerb(verb);
+        const ok = validate(receipt);
+        schemaValid = !!ok;
+        schemaErrors = ok ? null : (validate.errors || []).map((e) => ({
+          instancePath: e.instancePath,
+          schemaPath: e.schemaPath,
+          keyword: e.keyword,
+          message: e.message,
+          params: e.params,
+        }));
+      } catch (e) {
+        schemaValid = false;
+        schemaErrors = [{ message: e?.message || "schema validation failed" }];
+      }
+    }
 
-    return res.status(out.statusCode).json(out.body);
-  } catch (e) {
-    return res.status(504).json({
-      ok: false,
-      error: e?.message || "verify failed",
-      checks: { schema_valid: false, hash_matches: false, signature_valid: false },
-      values: {
-        verb: req.body?.x402?.verb ?? null,
-        signer_id: req.body?.metadata?.proof?.signer_id ?? null,
-        alg: req.body?.metadata?.proof?.alg ?? null,
-        canonical: req.body?.metadata?.proof?.canonical ?? null,
-        claimed_hash: req.body?.metadata?.proof?.hash_sha256 ?? null,
-        recomputed_hash: null,
-        pubkey_source: null,
+    return res.json({
+      ok: hashMatches && sigOk && schemaValid,
+      checks: {
+        schema_valid: schemaValid,
+        hash_matches: hashMatches,
+        signature_valid: sigOk,
       },
-      errors: { schema_errors: [{ message: "verify timed out" }], signature_error: null },
+      values: {
+        verb: receipt?.x402?.verb ?? null,
+        signer_id: proof.signer_id ?? null,
+        alg: proof.alg ?? null,
+        canonical: proof.canonical ?? null,
+        claimed_hash: proof.hash_sha256 ?? null,
+        recomputed_hash: recomputed,
+        pubkey_source: pubSrc,
+      },
+      errors: {
+        schema_errors: schemaErrors,
+        signature_error: signatureError,
+      },
     });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || "verify failed" });
   }
 });
 
