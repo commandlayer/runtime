@@ -23,7 +23,6 @@ const ENABLED_VERBS = (process.env.ENABLED_VERBS ||
   .filter(Boolean);
 
 const SIGNER_ID = process.env.RECEIPT_SIGNER_ID || process.env.ENS_NAME || "runtime";
-
 const PRIV_PEM_B64 = process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64 || "";
 const PUB_PEM_B64 = process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "";
 
@@ -33,13 +32,13 @@ const ENS_PUBKEY_TEXT_KEY = process.env.ENS_PUBKEY_TEXT_KEY || "cl.receipt.pubke
 const ETH_RPC_URL = process.env.ETH_RPC_URL || "";
 const ENS_LOOKUP_TIMEOUT_MS = Number(process.env.ENS_LOOKUP_TIMEOUT_MS || 2500);
 
-// AJV/schema (ONLY when schema=1)
+// AJV/schema (ONLY when schema=1, and SAFE)
 const SCHEMA_CACHE_TTL_MS = Number(process.env.SCHEMA_CACHE_TTL_MS || 600000);
 const SCHEMA_FETCH_TIMEOUT_MS = Number(process.env.SCHEMA_FETCH_TIMEOUT_MS || 5000);
 const AJV_COMPILE_TIMEOUT_MS = Number(process.env.AJV_COMPILE_TIMEOUT_MS || 4000);
 const SCHEMA_VALIDATE_TIMEOUT_MS = Number(process.env.SCHEMA_VALIDATE_TIMEOUT_MS || 2500);
 
-// Use www host to avoid redirect/ref mismatch
+// IMPORTANT: avoid redirects / ref mismatches
 const SCHEMA_HOST = process.env.SCHEMA_HOST || "https://www.commandlayer.org";
 
 // -------------------------
@@ -148,7 +147,7 @@ function makeReceipt({ x402, trace, result }) {
 }
 
 // -------------------------
-// ENS pubkey resolver (ethers) — HARD TIMEOUT
+// ENS pubkey resolver (ethers v6) — FIXED API
 // -------------------------
 let ensKeyCache = {
   fetched_at: null,
@@ -175,13 +174,22 @@ async function resolveEnsPubkeyPem({ refresh = false } = {}) {
   }
 
   try {
+    // ethers v6: provider.getResolver(name) then resolver.getText(key)
     const { ethers } = await import("ethers");
     const provider = new ethers.JsonRpcProvider(ETH_RPC_URL);
 
-    const txt = await withTimeout(
-      provider.getText(VERIFIER_ENS_NAME, ENS_PUBKEY_TEXT_KEY),
+    const resolver = await withTimeout(
+      provider.getResolver(VERIFIER_ENS_NAME),
       ENS_LOOKUP_TIMEOUT_MS,
-      "ens lookup timeout"
+      "ens resolver timeout"
+    );
+
+    if (!resolver) throw new Error(`No ENS resolver for ${VERIFIER_ENS_NAME}`);
+
+    const txt = await withTimeout(
+      resolver.getText(ENS_PUBKEY_TEXT_KEY),
+      ENS_LOOKUP_TIMEOUT_MS,
+      "ens text timeout"
     );
 
     if (!txt || typeof txt !== "string" || !txt.includes("BEGIN PUBLIC KEY")) {
@@ -205,7 +213,12 @@ async function resolveEnsPubkeyPem({ refresh = false } = {}) {
 }
 
 // -------------------------
-// AJV schema validation — ONLY when schema=1 (HARD TIMEOUTS)
+// AJV schema validation (SAFE mode)
+//
+// Key change to stop 502s:
+// - /verify never compiles/fetches schemas inside request unless schema=1
+// - even with schema=1: we DO NOT compile on demand (warm-only)
+// - you warm validators via POST /warm
 // -------------------------
 let ajv = null;
 
@@ -278,35 +291,34 @@ function receiptSchemaIdForVerb(verb) {
 }
 
 const validatorCache = new Map(); // schemaId -> { validate, fetchedAt }
-const inflightValidators = new Map(); // schemaId -> Promise
 
-async function getReceiptValidator(verb) {
+// warm-only: compile happens ONLY via /warm (not /verify)
+async function warmReceiptValidator(verb) {
   const schemaId = receiptSchemaIdForVerb(verb);
-  const now = Date.now();
 
   const cached = validatorCache.get(schemaId);
-  if (cached && now - cached.fetchedAt < SCHEMA_CACHE_TTL_MS) return cached.validate;
+  if (cached && Date.now() - cached.fetchedAt < SCHEMA_CACHE_TTL_MS) return { ok: true, schemaId, warmed: true };
 
-  if (inflightValidators.has(schemaId)) return await inflightValidators.get(schemaId);
+  const ajvInst = await getAjv();
+  const validate = await withTimeout(
+    ajvInst.compileAsync({ $ref: schemaId }),
+    AJV_COMPILE_TIMEOUT_MS,
+    "ajv compile timeout"
+  );
+  validatorCache.set(schemaId, { validate, fetchedAt: Date.now() });
+  return { ok: true, schemaId, warmed: true };
+}
 
-  const p = (async () => {
-    const ajvInst = await getAjv();
-    const compileP = ajvInst.compileAsync({ $ref: schemaId });
-    const validate = await withTimeout(compileP, AJV_COMPILE_TIMEOUT_MS, "ajv compile timeout");
-    validatorCache.set(schemaId, { validate, fetchedAt: Date.now() });
-    return validate;
-  })();
-
-  inflightValidators.set(schemaId, p);
-  try {
-    return await p;
-  } finally {
-    inflightValidators.delete(schemaId);
-  }
+function getCachedReceiptValidator(verb) {
+  const schemaId = receiptSchemaIdForVerb(verb);
+  const cached = validatorCache.get(schemaId);
+  if (!cached) return { ok: false, schemaId, validate: null };
+  if (Date.now() - cached.fetchedAt > SCHEMA_CACHE_TTL_MS) return { ok: false, schemaId, validate: null };
+  return { ok: true, schemaId, validate: cached.validate };
 }
 
 // -------------------------
-// Verb implementations (deterministic ref versions)
+// Verb implementations (deterministic reference versions)
 // -------------------------
 async function doFetch(body) {
   const url = body?.source || body?.input?.source || body?.input?.url;
@@ -369,11 +381,7 @@ function doFormat(body) {
     style = "table";
   }
 
-  return {
-    formatted_content: formatted,
-    style,
-    notes: "Deterministic reference formatter (non-LLM).",
-  };
+  return { formatted_content: formatted, style, notes: "Deterministic reference formatter (non-LLM)." };
 }
 
 function doClean(body) {
@@ -398,11 +406,7 @@ function doClean(body) {
 
   for (const op of ops) apply(op);
 
-  return {
-    cleaned_content: content,
-    operations_applied: ops,
-    issues_detected: issues,
-  };
+  return { cleaned_content: content, operations_applied: ops, issues_detected: issues };
 }
 
 function parseYamlBestEffort(text) {
@@ -472,10 +476,7 @@ function doSummarize(body) {
   }
   if (!summary) summary = content.slice(0, 400).trim();
 
-  return {
-    summary,
-    source_hash: sha256Hex(content),
-  };
+  return { summary, source_hash: sha256Hex(content) };
 }
 
 function doConvert(body) {
@@ -579,12 +580,7 @@ function doAnalyze(body) {
     Math.min(1, score).toFixed(3)
   )}.`;
 
-  return {
-    summary,
-    insights,
-    labels: labels.length ? labels : [],
-    score: Number(Math.min(1, score).toFixed(3)),
-  };
+  return { summary, insights, labels: labels.length ? labels : [], score: Number(Math.min(1, score).toFixed(3)) };
 }
 
 function doClassify(body) {
@@ -712,8 +708,28 @@ app.get("/debug/validators", (req, res) => {
       fetched_at: new Date(v.fetchedAt).toISOString(),
       ttl_ms: SCHEMA_CACHE_TTL_MS,
     })),
-    inflight: [...inflightValidators.keys()],
   });
+});
+
+// Warm endpoint: compile validators OUTSIDE /verify
+// POST /warm {"verbs":["clean","classify",...]}  OR no body => warm all enabled
+app.post("/warm", async (req, res) => {
+  const body = req.body || {};
+  let verbs = body?.verbs;
+
+  if (!Array.isArray(verbs) || !verbs.length) verbs = ENABLED_VERBS;
+
+  const results = [];
+  for (const v of verbs) {
+    try {
+      const r = await warmReceiptValidator(v);
+      results.push({ verb: v, ok: true, schemaId: r.schemaId });
+    } catch (e) {
+      results.push({ verb: v, ok: false, error: e?.message || "warm failed" });
+    }
+  }
+
+  res.json({ ok: results.every((r) => r.ok), results });
 });
 
 // -------------------------
@@ -760,10 +776,10 @@ for (const v of Object.keys(handlers)) {
 }
 
 // -------------------------
-// /verify — ALWAYS fast by default
+// /verify — always fast by default
 // - hash + signature always
-// - ENS only if ens=1 (hard-timeout, optional fallback)
-// - AJV only if schema=1 (hard-timeout; returns schema_valid=false on timeout)
+// - ENS only if ens=1 (fixed ethers v6 API)
+// - schema validation only if schema=1 AND validator is already warmed/cached (no compile here)
 // -------------------------
 app.post("/verify", async (req, res) => {
   try {
@@ -790,7 +806,7 @@ app.post("/verify", async (req, res) => {
 
     const verb = receipt?.x402?.verb ?? null;
 
-    // 1) Recompute hash from canonical unsigned receipt (FAST)
+    // 1) hash
     const unsigned = structuredClone(receipt);
     unsigned.metadata.proof.hash_sha256 = "";
     unsigned.metadata.proof.signature_b64 = "";
@@ -798,7 +814,7 @@ app.post("/verify", async (req, res) => {
     const recomputed = sha256Hex(canonical);
     const hashMatches = recomputed === proof.hash_sha256;
 
-    // 2) Pubkey selection (FAST default: env; ENS only if ens=1)
+    // 2) pubkey selection
     const wantEns = String(req.query.ens || "") === "1";
     const refresh = String(req.query.refresh || "") === "1";
     const allowFallback = String(req.query.fallback || "") === "1" || true; // default allow fallback
@@ -827,7 +843,7 @@ app.post("/verify", async (req, res) => {
       if (!pubPem) sigErr = "missing env public key";
     }
 
-    // 3) Verify signature (FAST)
+    // 3) signature verify
     let sigOk = false;
     if (pubPem) {
       try {
@@ -838,7 +854,7 @@ app.post("/verify", async (req, res) => {
       }
     }
 
-    // 4) Schema validation (ONLY if schema=1, HARD TIMEOUT)
+    // 4) schema validation (warm-only)
     const wantSchema = String(req.query.schema || "") === "1";
     let schemaValid = true;
     let schemaErrors = null;
@@ -848,32 +864,31 @@ app.post("/verify", async (req, res) => {
         schemaValid = false;
         schemaErrors = [{ message: "missing receipt.x402.verb" }];
       } else {
-        try {
-          const validateFn = await withTimeout(
-            getReceiptValidator(verb),
-            AJV_COMPILE_TIMEOUT_MS,
-            "schema validator timeout"
-          );
-
-          const ok = await withTimeout(
-            Promise.resolve(validateFn(receipt)),
-            SCHEMA_VALIDATE_TIMEOUT_MS,
-            "schema validate timeout"
-          );
-
-          if (!ok) {
-            schemaValid = false;
-            schemaErrors = (validateFn.errors || []).map((e) => ({
-              instancePath: e.instancePath,
-              schemaPath: e.schemaPath,
-              keyword: e.keyword,
-              message: e.message,
-              params: e.params,
-            }));
-          }
-        } catch (e) {
+        const cached = getCachedReceiptValidator(verb);
+        if (!cached.ok || !cached.validate) {
           schemaValid = false;
-          schemaErrors = [{ message: e?.message || "schema validation failed" }];
+          schemaErrors = [{ message: `validator not warmed for verb=${verb}. Call POST /warm first.` }];
+        } else {
+          try {
+            const ok = await withTimeout(
+              Promise.resolve(cached.validate(receipt)),
+              SCHEMA_VALIDATE_TIMEOUT_MS,
+              "schema validate timeout"
+            );
+            if (!ok) {
+              schemaValid = false;
+              schemaErrors = (cached.validate.errors || []).map((e) => ({
+                instancePath: e.instancePath,
+                schemaPath: e.schemaPath,
+                keyword: e.keyword,
+                message: e.message,
+                params: e.params,
+              }));
+            }
+          } catch (e) {
+            schemaValid = false;
+            schemaErrors = [{ message: e?.message || "schema validation failed" }];
+          }
         }
       }
     }
@@ -883,7 +898,7 @@ app.post("/verify", async (req, res) => {
     return res.json({
       ok,
       checks: {
-        schema_valid: wantSchema ? schemaValid : true, // if you didn't ask for schema, we don't block the call
+        schema_valid: wantSchema ? schemaValid : true,
         hash_matches: hashMatches,
         signature_valid: sigOk,
       },
