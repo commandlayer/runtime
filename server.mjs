@@ -30,7 +30,7 @@ const PUB_PEM_B64 = process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "";
 // ---- ENS verifier pubkey resolution (requires `ethers`)
 const VERIFIER_ENS_NAME = process.env.VERIFIER_ENS_NAME || SIGNER_ID;
 const ENS_PUBKEY_TEXT_KEY =
-  process.env.ENS_PUBKEY_TEXT_KEY || "cl.receipt.pubkey.pem"; // <-- NEW PATH
+  process.env.ENS_PUBKEY_TEXT_KEY || "cl.receipt.pubkey.pem";
 const ENS_CACHE_TTL_MS = Number(process.env.ENS_CACHE_TTL_MS || 10 * 60 * 1000);
 
 const ensCache = {
@@ -151,7 +151,6 @@ function verifyEd25519Base64(messageUtf8, signatureB64, pubPem) {
 }
 
 function makeReceipt({ x402, trace, result }) {
-  // receipt base-ish fields; keep it compatible with your schemas
   const receipt = {
     status: "success",
     x402,
@@ -287,12 +286,10 @@ function doFormat(body) {
   const target = input.target_style || "text";
   if (!content.trim()) throw new Error("format.input.content required");
 
-  // tiny deterministic reference formatter
   let formatted = content;
   let style = target;
 
   if (target === "table") {
-    // parse "a: 1" lines into a markdown table
     const lines = content
       .split(/\r?\n/)
       .map((s) => s.trim())
@@ -357,7 +354,6 @@ function doClean(body) {
 }
 
 function parseYamlBestEffort(text) {
-  // extremely small YAML subset: "k: v" per line
   const out = {};
   const lines = text.split(/\r?\n/);
   for (const ln of lines) {
@@ -393,7 +389,6 @@ function doParse(body) {
     parsed = parseYamlBestEffort(content);
     confidence = 0.75;
   } else {
-    // best effort: try json then yaml
     try {
       parsed = JSON.parse(content);
       confidence = 0.9;
@@ -420,7 +415,6 @@ function doSummarize(body) {
   const style = input.summary_style || "text";
   const format = (input.format_hint || "text").toLowerCase();
 
-  // simple deterministic summarizer: first 2 sentences or bullet points
   const sentences = content.split(/(?<=[.!?])\s+/).filter(Boolean);
   let summary = "";
 
@@ -461,7 +455,6 @@ function doConvert(body) {
   let lossy = false;
 
   if (src === "json" && tgt === "csv") {
-    // very small conversion: only supports flat object -> 2-row CSV
     let obj;
     try {
       obj = JSON.parse(content);
@@ -537,6 +530,212 @@ function doExplain(body) {
   return result;
 }
 
+// ---- NEW: analyze (schema expects body.input string, not body.input.content)
+function clamp01(n) {
+  if (Number.isNaN(n)) return 0;
+  if (n < 0) return 0;
+  if (n > 1) return 1;
+  return n;
+}
+
+function uniq(arr) {
+  return [...new Set(arr)];
+}
+
+function topNByCount(counts, n) {
+  return Object.entries(counts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n)
+    .map(([k]) => k);
+}
+
+function doAnalyze(body) {
+  const inputText = String(body?.input ?? "").trim();
+  if (!inputText) throw new Error("analyze.input required (string)");
+
+  const goal = body?.goal ? String(body.goal).trim() : "";
+  const hints = Array.isArray(body?.hints)
+    ? body.hints.map((s) => String(s).trim()).filter(Boolean)
+    : [];
+
+  const len = inputText.length;
+  const lines = inputText.split(/\r?\n/);
+  const nonEmptyLines = lines.filter((l) => l.trim() !== "");
+  const words = inputText.split(/\s+/).filter(Boolean);
+
+  const hasJsonLike = /[{[]/.test(inputText) && /[}\]]/.test(inputText);
+  const hasUrl = /\bhttps?:\/\/\S+/i.test(inputText);
+  const hasEmail = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(inputText);
+  const hasNumbers = /\d/.test(inputText);
+  const hasCodeFence = /```/.test(inputText);
+
+  let score = 0;
+  score += Math.min(0.25, words.length / 800);
+  score += Math.min(0.20, nonEmptyLines.length / 120);
+  score += hasJsonLike ? 0.15 : 0;
+  score += hasNumbers ? 0.10 : 0;
+  score += hasUrl ? 0.05 : 0;
+  score += hasEmail ? 0.05 : 0;
+  score += hasCodeFence ? 0.10 : 0;
+  score = clamp01(score);
+
+  const insights = [];
+  insights.push(
+    `Input length: ${len} chars; ~${words.length} words; ${nonEmptyLines.length} non-empty lines.`
+  );
+  if (goal) insights.push(`Goal: ${goal}`);
+  if (hints.length) insights.push(`Hints provided: ${hints.length}.`);
+  if (hasJsonLike) insights.push("Content appears to include JSON/structured data markers.");
+  if (hasCodeFence) insights.push("Content includes code-fence markers (```), likely code/logs.");
+  if (hasUrl) insights.push("Content includes URL(s).");
+  if (hasEmail) insights.push("Content includes email-like strings.");
+  if (hasNumbers) insights.push("Content includes numeric values.");
+
+  const stop = new Set([
+    "the","a","an","and","or","to","of","in","for","on","with",
+    "is","are","was","were","be","as","it","this","that","by","from"
+  ]);
+  const counts = {};
+  for (const wRaw of words.slice(0, 5000)) {
+    const w = wRaw.toLowerCase().replace(/[^a-z0-9._-]/g, "");
+    if (!w || w.length < 4) continue;
+    if (stop.has(w)) continue;
+    counts[w] = (counts[w] || 0) + 1;
+  }
+  const topTerms = topNByCount(counts, 6);
+  if (topTerms.length) insights.push(`Top terms: ${topTerms.join(", ")}`);
+
+  const labels = [];
+  if (hasJsonLike) labels.push("structured");
+  if (hasCodeFence) labels.push("code_or_logs");
+  if (hasUrl) labels.push("contains_urls");
+  if (hasEmail) labels.push("contains_emails");
+  if (words.length > 300) labels.push("longform");
+  if (nonEmptyLines.length > 30) labels.push("multiline");
+  if (!labels.length) labels.push("text");
+
+  const summary =
+    `Deterministic analysis: ${labels.join(", ")}.` +
+    (goal ? ` Goal="${goal}".` : "") +
+    ` Score=${score.toFixed(3)}.`;
+
+  return {
+    summary,
+    insights: insights.slice(0, 128),
+    labels: uniq(labels).slice(0, 64),
+    score,
+  };
+}
+
+// ---- NEW: classify (schema expects body.input.content + required actor/limits/channel)
+function tokenize(s) {
+  return String(s)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s._-]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function countKeywords(tokens, keywords) {
+  const set = new Set(tokens);
+  let hits = 0;
+  for (const k of keywords) if (set.has(k)) hits++;
+  return hits;
+}
+
+function doClassify(body) {
+  const actor = String(body?.actor ?? "").trim();
+  if (!actor) throw new Error("classify.actor required");
+
+  const limits = body?.limits;
+  if (!limits || typeof limits !== "object") throw new Error("classify.limits required");
+
+  const channel = body?.channel;
+  if (!channel || typeof channel !== "object") throw new Error("classify.channel required");
+
+  const content = String(body?.input?.content ?? "").trim();
+  if (!content) throw new Error("classify.input.content required");
+
+  const maxLabels = Math.min(128, Math.max(1, Number(limits?.max_labels ?? 5)));
+
+  const providedTaxonomy = Array.isArray(body?.input?.taxonomy)
+    ? body.input.taxonomy.map((s) => String(s).trim()).filter(Boolean).slice(0, 128)
+    : [];
+
+  const hasJsonLike = /[{[]/.test(content) && /[}\]]/.test(content);
+  const hasUrl = /\bhttps?:\/\/\S+/i.test(content);
+  const hasEmail = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(content);
+  const hasCodeFence = /```/.test(content);
+  const hasErrorWords = /\b(error|exception|stack|traceback|failed|timeout)\b/i.test(content);
+
+  const tokens = tokenize(content);
+
+  const candidates = providedTaxonomy.length
+    ? providedTaxonomy
+    : [
+        "security",
+        "finance",
+        "legal",
+        "support",
+        "structured",
+        "code_or_logs",
+        "contains_urls",
+        "contains_emails",
+        "general",
+      ];
+
+  const labelKeywords = {
+    security: ["vuln", "exploit", "attack", "malware", "phishing", "token", "wallet", "private", "key", "auth", "signature"],
+    finance: ["invoice", "payment", "price", "cost", "usd", "revenue", "billing", "charge", "refund"],
+    legal: ["contract", "terms", "policy", "compliance", "law", "agreement", "license"],
+    support: ["help", "issue", "bug", "ticket", "support", "troubleshoot", "problem"],
+    structured: ["json", "yaml", "schema", "object", "array"],
+    code_or_logs: ["error", "exception", "stack", "traceback", "log", "node", "npm", "curl"],
+    contains_urls: ["http", "https", "www"],
+    contains_emails: ["@mail", "@gmail", "@yahoo"],
+    general: [],
+  };
+
+  const scored = candidates
+    .map((labelRaw) => {
+      const label = String(labelRaw).trim();
+      if (!label) return null;
+
+      const kws = labelKeywords[label] || [];
+      const overlap = kws.length ? countKeywords(tokens, kws) / kws.length : 0;
+
+      let boost = 0;
+      if (label === "structured" && hasJsonLike) boost += 0.35;
+      if (label === "code_or_logs" && (hasCodeFence || hasErrorWords)) boost += 0.35;
+      if (label === "contains_urls" && hasUrl) boost += 0.50;
+      if (label === "contains_emails" && hasEmail) boost += 0.50;
+
+      const score = clamp01(overlap * 0.7 + boost);
+      return { label, score };
+    })
+    .filter(Boolean);
+
+  scored.sort((a, b) => (b.score - a.score) || a.label.localeCompare(b.label));
+
+  let picked = scored.slice(0, maxLabels);
+  if (!picked.length) picked = [{ label: "general", score: 0.25 }];
+
+  const allZero = picked.every((p) => p.score === 0);
+  if (allZero && !picked.some((p) => p.label === "general")) {
+    picked[picked.length - 1] = { label: "general", score: 0.25 };
+  }
+
+  const labels = uniq(picked.map((p) => p.label)).slice(0, 128);
+  const scores = labels.map((l) => {
+    const found = picked.find((p) => p.label === l);
+    return clamp01(found ? found.score : 0.2);
+  });
+
+  const taxonomy = providedTaxonomy.length ? providedTaxonomy : ["root", labels[0] || "general"];
+
+  return { labels, scores, taxonomy };
+}
+
 // Router: dispatch by verb
 const handlers = {
   fetch: doFetch,
@@ -547,6 +746,8 @@ const handlers = {
   summarize: async (b) => doSummarize(b),
   convert: async (b) => doConvert(b),
   explain: async (b) => doExplain(b),
+  analyze: async (b) => doAnalyze(b),
+  classify: async (b) => doClassify(b),
 };
 
 function enabled(verb) {
@@ -576,16 +777,18 @@ async function handleVerb(verb, req, res) {
   };
 
   try {
-    const x402 = req.body?.x402 || {
-      verb,
-      version: "1.0.0",
-      entry: `x402://${verb}agent.eth/${verb}/v1.0.0`,
-    };
+    const x402 =
+      req.body?.x402 || {
+        verb,
+        version: "1.0.0",
+        entry: `x402://${verb}agent.eth/${verb}/v1.0.0`,
+      };
 
     // enforce a hard timeout if caller asks
     const timeoutMs = Number(
       req.body?.limits?.timeout_ms || req.body?.limits?.max_latency_ms || 0
     );
+
     const work = Promise.resolve(handlers[verb](req.body));
     const result = timeoutMs
       ? await Promise.race([
@@ -605,7 +808,6 @@ async function handleVerb(verb, req, res) {
     trace.completed_at = nowIso();
     trace.duration_ms = Date.now() - started;
 
-    // return an error envelope (NOT a receipt)
     return res
       .status(500)
       .json(makeError(500, e?.message || "unknown error", { verb, trace }));
@@ -641,7 +843,6 @@ app.post("/verify", async (req, res) => {
       });
     }
 
-    // recompute hash from canonical unsigned receipt
     const unsigned = structuredClone(receipt);
     unsigned.metadata.proof.hash_sha256 = "";
     unsigned.metadata.proof.signature_b64 = "";
@@ -709,7 +910,7 @@ app.post("/verify", async (req, res) => {
     return res.json({
       ok: hashMatches && sigOk,
       checks: {
-        schema_valid: true, // assumed unless AJV layer is added
+        schema_valid: true,
         hash_matches: hashMatches,
         signature_valid: sigOk,
       },
