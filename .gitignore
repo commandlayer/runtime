@@ -1,2 +1,5 @@
 node_modules/
-*.json
+receipt.json
+analyze_receipt.json
+classify_receipt.json
+bad.json
