@@ -21,9 +21,25 @@ const ENABLED_VERBS = (process.env.ENABLED_VERBS || "fetch")
   .map((s) => s.trim())
   .filter(Boolean);
 
-const SIGNER_ID = process.env.RECEIPT_SIGNER_ID || process.env.ENS_NAME || "runtime";
+const SIGNER_ID =
+  process.env.RECEIPT_SIGNER_ID || process.env.ENS_NAME || "runtime";
+
 const PRIV_PEM_B64 = process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64 || "";
 const PUB_PEM_B64 = process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "";
+
+// ---- ENS verifier pubkey resolution (requires `ethers`)
+const VERIFIER_ENS_NAME = process.env.VERIFIER_ENS_NAME || SIGNER_ID;
+const ENS_PUBKEY_TEXT_KEY =
+  process.env.ENS_PUBKEY_TEXT_KEY || "cl.receipt.pubkey.pem"; // <-- NEW PATH
+const ENS_CACHE_TTL_MS = Number(process.env.ENS_CACHE_TTL_MS || 10 * 60 * 1000);
+
+const ensCache = {
+  fetched_at: 0,
+  ens_name: VERIFIER_ENS_NAME,
+  key: ENS_PUBKEY_TEXT_KEY,
+  pubkey_pem: null,
+  error: null,
+};
 
 function nowIso() {
   return new Date().toISOString();
@@ -60,6 +76,61 @@ function pemFromB64(b64) {
   return pem.includes("BEGIN") ? pem : null;
 }
 
+function normalizePemFromTxt(txt) {
+  if (!txt || typeof txt !== "string") return null;
+  const pem = txt.includes("\\n") ? txt.replace(/\\n/g, "\n") : txt;
+  if (!pem.includes("BEGIN PUBLIC KEY") || !pem.includes("END PUBLIC KEY"))
+    return null;
+  return pem.trim();
+}
+
+async function resolveEnsPubkeyPem({ refresh = false } = {}) {
+  if (!process.env.ETH_RPC_URL) {
+    ensCache.error = "Missing ETH_RPC_URL";
+    return { ok: false, source: null, pubkey_pem: null, error: ensCache.error };
+  }
+
+  const now = Date.now();
+  const expired = now - ensCache.fetched_at > ENS_CACHE_TTL_MS;
+  if (!refresh && ensCache.pubkey_pem && !expired) {
+    return {
+      ok: true,
+      source: "ens-cache",
+      pubkey_pem: ensCache.pubkey_pem,
+      error: null,
+    };
+  }
+
+  try {
+    const { ethers } = await import("ethers");
+    const provider = new ethers.JsonRpcProvider(process.env.ETH_RPC_URL);
+
+    const resolver = await provider.getResolver(VERIFIER_ENS_NAME);
+    if (!resolver)
+      throw new Error(`No resolver for ENS name: ${VERIFIER_ENS_NAME}`);
+
+    const raw = await resolver.getText(ENS_PUBKEY_TEXT_KEY);
+    const pem = normalizePemFromTxt(raw);
+    if (!pem) throw new Error(`TXT key missing/invalid: ${ENS_PUBKEY_TEXT_KEY}`);
+
+    ensCache.fetched_at = now;
+    ensCache.ens_name = VERIFIER_ENS_NAME;
+    ensCache.key = ENS_PUBKEY_TEXT_KEY;
+    ensCache.pubkey_pem = pem;
+    ensCache.error = null;
+
+    return { ok: true, source: "ens", pubkey_pem: pem, error: null };
+  } catch (e) {
+    ensCache.fetched_at = now;
+    ensCache.ens_name = VERIFIER_ENS_NAME;
+    ensCache.key = ENS_PUBKEY_TEXT_KEY;
+    ensCache.pubkey_pem = null;
+    ensCache.error = e?.message || "ENS resolution failed";
+
+    return { ok: false, source: null, pubkey_pem: null, error: ensCache.error };
+  }
+}
+
 function signEd25519Base64(messageUtf8) {
   const pem = pemFromB64(PRIV_PEM_B64);
   if (!pem) throw new Error("Missing RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64");
@@ -71,7 +142,12 @@ function signEd25519Base64(messageUtf8) {
 
 function verifyEd25519Base64(messageUtf8, signatureB64, pubPem) {
   const key = crypto.createPublicKey(pubPem);
-  return crypto.verify(null, Buffer.from(messageUtf8, "utf8"), key, Buffer.from(signatureB64, "base64"));
+  return crypto.verify(
+    null,
+    Buffer.from(messageUtf8, "utf8"),
+    key,
+    Buffer.from(signatureB64, "base64")
+  );
 }
 
 function makeReceipt({ x402, trace, result }) {
@@ -125,6 +201,29 @@ app.get("/debug/env", (req, res) => {
     signer_ok: !!pemFromB64(PRIV_PEM_B64),
     has_priv_b64: !!PRIV_PEM_B64,
     has_pub_b64: !!PUB_PEM_B64,
+    verifier_ens_name: VERIFIER_ENS_NAME,
+    ens_pubkey_text_key: ENS_PUBKEY_TEXT_KEY,
+    has_rpc: !!process.env.ETH_RPC_URL,
+  });
+});
+
+app.get("/debug/enskey", async (req, res) => {
+  const refresh = String(req.query.refresh || "") === "1";
+  const r = await resolveEnsPubkeyPem({ refresh });
+
+  res.json({
+    ok: r.ok,
+    pubkey_source: r.ok ? r.source : null,
+    ens_name: VERIFIER_ENS_NAME,
+    txt_key: ENS_PUBKEY_TEXT_KEY,
+    cache: {
+      fetched_at: ensCache.fetched_at
+        ? new Date(ensCache.fetched_at).toISOString()
+        : null,
+      ttl_ms: ENS_CACHE_TTL_MS,
+    },
+    preview: r.pubkey_pem ? r.pubkey_pem.slice(0, 80) + "..." : null,
+    error: r.error || null,
   });
 });
 
@@ -194,7 +293,10 @@ function doFormat(body) {
 
   if (target === "table") {
     // parse "a: 1" lines into a markdown table
-    const lines = content.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    const lines = content
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter(Boolean);
     const rows = [];
     for (const ln of lines) {
       const m = ln.match(/^([^:]+):\s*(.*)$/);
@@ -224,13 +326,21 @@ function doClean(body) {
   const issues = [];
 
   const apply = (op) => {
-    if (op === "normalize_newlines") content = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    if (op === "normalize_newlines")
+      content = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
     if (op === "collapse_whitespace") content = content.replace(/[ \t]+/g, " ");
     if (op === "trim") content = content.trim();
-    if (op === "remove_empty_lines") content = content.split("\n").filter((l) => l.trim() !== "").join("\n");
+    if (op === "remove_empty_lines")
+      content = content
+        .split("\n")
+        .filter((l) => l.trim() !== "")
+        .join("\n");
     if (op === "redact_emails") {
       const before = content;
-      content = content.replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted-email]");
+      content = content.replace(
+        /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi,
+        "[redacted-email]"
+      );
       if (content !== before) issues.push("emails_redacted");
     }
   };
@@ -290,7 +400,8 @@ function doParse(body) {
     } catch {
       parsed = parseYamlBestEffort(content);
       confidence = Object.keys(parsed).length ? 0.6 : 0.3;
-      if (!Object.keys(parsed).length) warnings.push("Could not confidently parse content.");
+      if (!Object.keys(parsed).length)
+        warnings.push("Could not confidently parse content.");
     }
   }
 
@@ -314,7 +425,9 @@ function doSummarize(body) {
   let summary = "";
 
   if (style === "bullet_points") {
-    const picks = sentences.slice(0, 3).map((s) => s.replace(/\s+/g, " ").trim());
+    const picks = sentences
+      .slice(0, 3)
+      .map((s) => s.replace(/\s+/g, " ").trim());
     summary = picks.join(" ");
   } else {
     summary = sentences.slice(0, 2).join(" ").trim();
@@ -322,7 +435,9 @@ function doSummarize(body) {
   if (!summary) summary = content.slice(0, 400).trim();
 
   const srcHash = sha256Hex(content);
-  const cr = summary.length ? Number((content.length / summary.length).toFixed(3)) : 0;
+  const cr = summary.length
+    ? Number((content.length / summary.length).toFixed(3))
+    : 0;
 
   return {
     summary,
@@ -447,7 +562,8 @@ function requireBody(req, res) {
 }
 
 async function handleVerb(verb, req, res) {
-  if (!enabled(verb)) return res.status(404).json(makeError(404, `Verb not enabled: ${verb}`));
+  if (!enabled(verb))
+    return res.status(404).json(makeError(404, `Verb not enabled: ${verb}`));
   if (!requireBody(req, res)) return;
 
   const started = Date.now();
@@ -460,15 +576,23 @@ async function handleVerb(verb, req, res) {
   };
 
   try {
-    const x402 = req.body?.x402 || { verb, version: "1.0.0", entry: `x402://${verb}agent.eth/${verb}/v1.0.0` };
+    const x402 = req.body?.x402 || {
+      verb,
+      version: "1.0.0",
+      entry: `x402://${verb}agent.eth/${verb}/v1.0.0`,
+    };
 
     // enforce a hard timeout if caller asks
-    const timeoutMs = Number(req.body?.limits?.timeout_ms || req.body?.limits?.max_latency_ms || 0);
+    const timeoutMs = Number(
+      req.body?.limits?.timeout_ms || req.body?.limits?.max_latency_ms || 0
+    );
     const work = Promise.resolve(handlers[verb](req.body));
     const result = timeoutMs
       ? await Promise.race([
           work,
-          new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), timeoutMs)),
+          new Promise((_, rej) =>
+            setTimeout(() => rej(new Error("timeout")), timeoutMs)
+          ),
         ])
       : await work;
 
@@ -482,7 +606,9 @@ async function handleVerb(verb, req, res) {
     trace.duration_ms = Date.now() - started;
 
     // return an error envelope (NOT a receipt)
-    return res.status(500).json(makeError(500, e?.message || "unknown error", { verb, trace }));
+    return res
+      .status(500)
+      .json(makeError(500, e?.message || "unknown error", { verb, trace }));
   }
 }
 
@@ -491,17 +617,26 @@ for (const v of Object.keys(handlers)) {
   app.post(`/${v}/v1.0.0`, (req, res) => handleVerb(v, req, res));
 }
 
-// Verify endpoint: validates signature/hash (and optionally ENS pubkey if you pass ens=1 AND provide pub key in env here)
-app.post("/verify", (req, res) => {
+// Verify endpoint: validates signature/hash and supports ENS pubkey resolution
+app.post("/verify", async (req, res) => {
   try {
     const receipt = req.body;
     const proof = receipt?.metadata?.proof;
+
     if (!proof?.signature_b64 || !proof?.hash_sha256) {
       return res.status(400).json({
         ok: false,
         checks: { schema_valid: false, hash_matches: false, signature_valid: false },
-        values: { verb: null, signer_id: null, alg: null, canonical: null, claimed_hash: null, recomputed_hash: null, pubkey_source: null },
-        errors: { schema_errors: null, signature_error: null },
+        values: {
+          verb: null,
+          signer_id: null,
+          alg: null,
+          canonical: null,
+          claimed_hash: null,
+          recomputed_hash: null,
+          pubkey_source: null,
+        },
+        errors: { schema_errors: null, signature_error: "missing signature/hash" },
         error: "missing metadata.proof.signature_b64 or hash_sha256",
       });
     }
@@ -515,26 +650,68 @@ app.post("/verify", (req, res) => {
 
     const hashMatches = recomputed === proof.hash_sha256;
 
-    // verify using env public key if present; if not, we can only report hash match
-    const pubPem = pemFromB64(PUB_PEM_B64);
-    let sigOk = false;
+    const wantEns = String(req.query.ens || "") === "1";
+    const refresh = String(req.query.refresh || "") === "1";
+    const allowFallback = String(req.query.fallback || "") === "1";
+
+    let pubPem = null;
     let pubSrc = null;
 
-    if (pubPem) {
-      sigOk = verifyEd25519Base64(proof.hash_sha256, proof.signature_b64, pubPem);
-      pubSrc = "env-b64";
+    if (wantEns) {
+      const r = await resolveEnsPubkeyPem({ refresh });
+      if (r.ok) {
+        pubPem = r.pubkey_pem;
+        pubSrc = "ens";
+      } else if (allowFallback) {
+        pubPem = pemFromB64(PUB_PEM_B64);
+        pubSrc = pubPem ? "env-b64" : null;
+      } else {
+        return res.status(400).json({
+          ok: false,
+          checks: { schema_valid: true, hash_matches: hashMatches, signature_valid: false },
+          values: {
+            verb: receipt?.x402?.verb ?? null,
+            signer_id: proof.signer_id ?? null,
+            alg: proof.alg ?? null,
+            canonical: proof.canonical ?? null,
+            claimed_hash: proof.hash_sha256 ?? null,
+            recomputed_hash: recomputed,
+            pubkey_source: null,
+          },
+          errors: { schema_errors: null, signature_error: r.error || "ENS pubkey resolution failed" },
+          error: "ens pubkey resolution failed (use fallback=1 to allow env pubkey)",
+        });
+      }
     } else {
-      // we can’t verify signature without a pubkey here
+      pubPem = pemFromB64(PUB_PEM_B64);
+      pubSrc = pubPem ? "env-b64" : null;
+    }
+
+    let sigOk = false;
+    let sigErr = null;
+
+    if (pubPem) {
+      try {
+        sigOk = verifyEd25519Base64(
+          proof.hash_sha256,
+          proof.signature_b64,
+          pubPem
+        );
+      } catch (e) {
+        sigOk = false;
+        sigErr = e?.message || "signature verify failed";
+      }
+    } else {
       sigOk = false;
-      pubSrc = null;
+      sigErr = "no pubkey available";
     }
 
     return res.json({
-      ok: hashMatches && (pubPem ? sigOk : true),
+      ok: hashMatches && sigOk,
       checks: {
-        schema_valid: true, // runtime assumes schema-valid receipts; schema checks belong to AJV layer if you add it
+        schema_valid: true, // assumed unless AJV layer is added
         hash_matches: hashMatches,
-        signature_valid: pubPem ? sigOk : true,
+        signature_valid: sigOk,
       },
       values: {
         verb: receipt?.x402?.verb ?? null,
@@ -545,7 +722,7 @@ app.post("/verify", (req, res) => {
         recomputed_hash: recomputed,
         pubkey_source: pubSrc,
       },
-      errors: { schema_errors: null, signature_error: null },
+      errors: { schema_errors: null, signature_error: sigErr },
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || "verify failed" });
