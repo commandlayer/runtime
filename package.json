@@ -7,14 +7,8 @@
     "start": "node server.mjs"
   },
   "dependencies": {
-<<<<<<< HEAD
     "ajv": "^8.0.0",
     "ajv-formats": "^3.0.0",
-=======
-    "ajv": "^8.17.1",
-    "ajv-formats": "^3.0.1",
-    "cors": "^2.8.5",
->>>>>>> cb94ab1 (AJV schema validation in /verify)
     "ethers": "^6.16.0",
     "express": "^4.18.0",
     "node-fetch": "^3.3.2"
