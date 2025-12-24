@@ -1,6 +1,4 @@
-*** server.mjs (patch) ***
 
-@@
  import express from "express";
  import crypto from "crypto";
  import Ajv from "ajv";
