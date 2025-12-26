@@ -30,6 +30,14 @@ const SIGNER_ID = process.env.RECEIPT_SIGNER_ID || process.env.ENS_NAME || "runt
 const PRIV_PEM_B64 = process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64 || "";
 const PUB_PEM_B64 = process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "";
 
+// ---- service identity / discovery (NEW)
+const SERVICE_NAME = process.env.SERVICE_NAME || "commandlayer-runtime";
+const SERVICE_VERSION = process.env.SERVICE_VERSION || "1.0.0";
+// Canonical base for humans (set this in Railway to https://runtime.commandlayer.org)
+const CANONICAL_BASE = (process.env.CANONICAL_BASE_URL || "https://runtime.commandlayer.org").replace(/\/+$/, "");
+// Path version used in routes: "/<verb>/v1.0.0"
+const API_VERSION = process.env.API_VERSION || "1.0.0";
+
 // ENS verifier config
 const ETH_RPC_URL = process.env.ETH_RPC_URL || "";
 const VERIFIER_ENS_NAME = process.env.VERIFIER_ENS_NAME || process.env.ENS_NAME || SIGNER_ID || "";
@@ -836,7 +844,10 @@ async function handleVerb(verb, req, res) {
     const x402 = req.body?.x402 || { verb, version: "1.0.0", entry: `x402://${verb}agent.eth/${verb}/v1.0.0` };
 
     const callerTimeout = Number(req.body?.limits?.timeout_ms || req.body?.limits?.max_latency_ms || 0);
-    const timeoutMs = Math.min(SERVER_MAX_HANDLER_MS, callerTimeout && callerTimeout > 0 ? callerTimeout : SERVER_MAX_HANDLER_MS);
+    const timeoutMs = Math.min(
+      SERVER_MAX_HANDLER_MS,
+      callerTimeout && callerTimeout > 0 ? callerTimeout : SERVER_MAX_HANDLER_MS
+    );
 
     const work = Promise.resolve(handlers[verb](req.body));
     const result = timeoutMs
@@ -849,8 +860,8 @@ async function handleVerb(verb, req, res) {
     const actor = req.body?.actor
       ? { id: String(req.body.actor), role: "user" }
       : req.body?.x402?.tenant
-        ? { id: String(req.body.x402.tenant), role: "tenant" }
-        : null;
+      ? { id: String(req.body.x402.tenant), role: "tenant" }
+      : null;
 
     const receipt = makeReceipt({ x402, trace, result, status: "success", actor });
     return res.json(receipt);
@@ -864,8 +875,8 @@ async function handleVerb(verb, req, res) {
     const actor = req.body?.actor
       ? { id: String(req.body.actor), role: "user" }
       : req.body?.x402?.tenant
-        ? { id: String(req.body.x402.tenant), role: "tenant" }
-        : null;
+      ? { id: String(req.body.x402.tenant), role: "tenant" }
+      : null;
 
     const err = {
       code: String(e?.code || "INTERNAL_ERROR"),
@@ -880,9 +891,49 @@ async function handleVerb(verb, req, res) {
 }
 
 // -----------------------
-// health/debug
+// health/index/debug (UPDATED)
 // -----------------------
-app.get("/health", (req, res) => res.status(200).send("ok"));
+
+// NEW: runtime index at "/"
+app.get("/", (req, res) => {
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  const verbs = (ENABLED_VERBS || []).map((v) => `/${v}/v${API_VERSION}`);
+  return res.status(200).end(
+    JSON.stringify({
+      ok: true,
+      service: SERVICE_NAME,
+      version: SERVICE_VERSION,
+      api_version: API_VERSION,
+      base: CANONICAL_BASE,
+      health: "/health",
+      verify: "/verify",
+      verbs,
+      docs: "https://commandlayer.org/runtime.html",
+      schemas: "https://commandlayer.org/schemas",
+      time: nowIso(),
+    })
+  );
+});
+
+// UPDATED: JSON health (was plain "ok")
+app.get("/health", (req, res) => {
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  return res.status(200).end(
+    JSON.stringify({
+      ok: true,
+      service: SERVICE_NAME,
+      version: SERVICE_VERSION,
+      api_version: API_VERSION,
+      base: CANONICAL_BASE,
+      node: process.version,
+      port: PORT,
+      enabled_verbs: ENABLED_VERBS,
+      signer_id: SIGNER_ID,
+      signer_ok: !!pemFromB64(PRIV_PEM_B64),
+      time: nowIso(),
+    })
+  );
+});
 
 app.get("/debug/env", (req, res) => {
   res.json({
@@ -914,6 +965,12 @@ app.get("/debug/env", (req, res) => {
       validator_cache_ttl_ms: VALIDATOR_CACHE_TTL_MS,
     },
     server_max_handler_ms: SERVER_MAX_HANDLER_MS,
+
+    // discovery identity
+    service_name: SERVICE_NAME,
+    service_version: SERVICE_VERSION,
+    api_version: API_VERSION,
+    canonical_base_url: CANONICAL_BASE,
   });
 });
 
