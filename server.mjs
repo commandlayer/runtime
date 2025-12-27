@@ -33,7 +33,9 @@ const PUB_PEM_B64 = process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "";
 // ---- service identity / discovery
 const SERVICE_NAME = process.env.SERVICE_NAME || "commandlayer-runtime";
 const SERVICE_VERSION = process.env.SERVICE_VERSION || "1.0.0";
+// Canonical base for humans (set this in Railway to https://runtime.commandlayer.org)
 const CANONICAL_BASE = (process.env.CANONICAL_BASE_URL || "https://runtime.commandlayer.org").replace(/\/+$/, "");
+// Path version used in routes: "/<verb>/v1.0.0"
 const API_VERSION = process.env.API_VERSION || "1.0.0";
 
 // ENS verifier config
@@ -47,16 +49,16 @@ const SCHEMA_HOST = (process.env.SCHEMA_HOST || "https://www.commandlayer.org").
 const SCHEMA_FETCH_TIMEOUT_MS = Number(process.env.SCHEMA_FETCH_TIMEOUT_MS || 8000);
 const SCHEMA_VALIDATE_BUDGET_MS = Number(process.env.SCHEMA_VALIDATE_BUDGET_MS || 3500);
 
-// ---- scaling + safety knobs
+// ---- scaling + safety knobs (server-side caps)
 const MAX_JSON_CACHE_ENTRIES = Number(process.env.MAX_JSON_CACHE_ENTRIES || 256);
 const JSON_CACHE_TTL_MS = Number(process.env.JSON_CACHE_TTL_MS || 10 * 60 * 1000);
 const MAX_VALIDATOR_CACHE_ENTRIES = Number(process.env.MAX_VALIDATOR_CACHE_ENTRIES || 128);
 const VALIDATOR_CACHE_TTL_MS = Number(process.env.VALIDATOR_CACHE_TTL_MS || 30 * 60 * 1000);
-const SERVER_MAX_HANDLER_MS = Number(process.env.SERVER_MAX_HANDLER_MS || 12000);
+const SERVER_MAX_HANDLER_MS = Number(process.env.SERVER_MAX_HANDLER_MS || 12000); // hard cap even if caller doesn't set limits
 
 // fetch hardening
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 8000);
-const FETCH_MAX_BYTES = Number(process.env.FETCH_MAX_BYTES || 256 * 1024);
+const FETCH_MAX_BYTES = Number(process.env.FETCH_MAX_BYTES || 256 * 1024); // cap preview + protect memory
 const ENABLE_SSRF_GUARD = String(process.env.ENABLE_SSRF_GUARD || "1") === "1";
 const ALLOW_FETCH_HOSTS = (process.env.ALLOW_FETCH_HOSTS || "")
   .split(",")
@@ -101,6 +103,7 @@ function pemFromB64(b64) {
 
 function normalizePem(text) {
   if (!text) return null;
+  // Handle ENS records that store "\n" escaped
   const pem = String(text).replace(/\\n/g, "\n").trim();
   return pem.includes("BEGIN") ? pem : null;
 }
@@ -109,6 +112,7 @@ function signEd25519Base64(messageUtf8) {
   const pem = pemFromB64(PRIV_PEM_B64);
   if (!pem) throw new Error("Missing RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64");
   const key = crypto.createPrivateKey(pem);
+  // For Ed25519: algorithm is null
   const sig = crypto.sign(null, Buffer.from(messageUtf8, "utf8"), key);
   return sig.toString("base64");
 }
@@ -138,8 +142,9 @@ function requireBody(req, res) {
 // SSRF guard for fetch()
 // -----------------------
 function isPrivateIp(ip) {
+  // ipv4 only guard (good enough to kill the common SSRF abuse paths)
   if (!net.isIP(ip)) return false;
-  if (net.isIP(ip) === 6) return true; // block ipv6 by default
+  if (net.isIP(ip) === 6) return true; // treat ipv6 as blocked unless you add explicit handling
   const parts = ip.split(".").map((n) => Number(n));
   const [a, b] = parts;
   if (a === 10) return true;
@@ -148,11 +153,12 @@ function isPrivateIp(ip) {
   if (a === 172 && b >= 16 && b <= 31) return true;
   if (a === 192 && b === 168) return true;
   if (a === 0) return true;
-  if (a === 100 && b >= 64 && b <= 127) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
   return false;
 }
 
 async function resolveARecords(hostname) {
+  // Avoid extra deps; use global DNS via node's built-in resolver
   const dns = await import("dns/promises");
   try {
     const addrs = await dns.resolve4(hostname);
@@ -173,16 +179,20 @@ async function ssrfGuardOrThrow(urlStr) {
   if (!/^https?:$/.test(u.protocol)) throw new Error("fetch only allows http(s)");
   const host = (u.hostname || "").toLowerCase();
 
+  // Optional allowlist (strongest)
   if (ALLOW_FETCH_HOSTS.length) {
     const ok = ALLOW_FETCH_HOSTS.some((h) => host === h || host.endsWith("." + h));
     if (!ok) throw new Error("fetch host not allowed");
   }
 
+  // Block obvious metadata targets
   if (host === "localhost" || host.endsWith(".localhost")) throw new Error("fetch host blocked");
   if (host === "169.254.169.254") throw new Error("fetch host blocked");
 
+  // Block direct IPs in private ranges
   if (net.isIP(host) && isPrivateIp(host)) throw new Error("fetch to private IP blocked");
 
+  // Block DNS that resolves to private IPs
   const addrs = await resolveARecords(host);
   if (addrs.some(isPrivateIp)) throw new Error("fetch DNS resolves to private IP (blocked)");
 }
@@ -236,7 +246,7 @@ async function fetchEnsPubkeyPem({ refresh = false } = {}) {
 }
 
 // -----------------------
-// AJV schema validation (FIXED: no compileAsync hangs)
+// AJV schema validation (with safe time budgets)
 // -----------------------
 const schemaJsonCache = new Map(); // url -> { fetchedAt, schema }
 const validatorCache = new Map(); // verb -> { compiledAt, validate }
@@ -251,6 +261,7 @@ function cachePrune(map, { ttlMs, maxEntries, tsField = "fetchedAt" } = {}) {
     }
   }
   if (maxEntries && maxEntries > 0 && map.size > maxEntries) {
+    // delete oldest
     const entries = Array.from(map.entries()).sort((a, b) => {
       const ta = a[1]?.[tsField] || 0;
       const tb = b[1]?.[tsField] || 0;
@@ -267,7 +278,9 @@ function normalizeSchemaFetchUrl(url) {
   u = u.replace(/^http:\/\//i, "https://");
   u = u.replace(/^https:\/\/commandlayer\.org/i, "https://www.commandlayer.org");
   u = u.replace(/^https:\/\/www\.commandlayer\.org\/+/, "https://www.commandlayer.org/");
+  // also honor SCHEMA_HOST if you override it
   if (SCHEMA_HOST.startsWith("https://www.commandlayer.org")) {
+    // ensure schemas fetch from www
     u = u.replace(/^https:\/\/commandlayer\.org/i, "https://www.commandlayer.org");
   }
   return u;
@@ -302,7 +315,7 @@ function makeAjv() {
     allErrors: true,
     strict: false,
     validateSchema: false,
-    // Keep loadSchema for any straggler refs, but we try to addSchema() most of what we need.
+    // Async loading for $ref
     loadSchema: async (uri) => {
       return await fetchJsonWithTimeout(uri, SCHEMA_FETCH_TIMEOUT_MS);
     },
@@ -312,6 +325,7 @@ function makeAjv() {
 }
 
 function receiptSchemaUrlForVerb(verb) {
+  // receipts are published under /schemas/v1.0.0/commons/<verb>/receipts/<verb>.receipt.schema.json
   return `${SCHEMA_HOST}/schemas/v1.0.0/commons/${verb}/receipts/${verb}.receipt.schema.json`;
 }
 
@@ -322,38 +336,32 @@ async function getValidatorForVerb(verb) {
     tsField: "compiledAt",
   });
 
+  // cache hit
   const hit = validatorCache.get(verb);
   if (hit?.validate) return hit.validate;
 
+  // inflight dedupe
   if (inflightValidator.has(verb)) return await inflightValidator.get(verb);
 
   const build = (async () => {
     const ajv = makeAjv();
+    const url = receiptSchemaUrlForVerb(verb);
 
-    const receiptUrl = receiptSchemaUrlForVerb(verb);
-
-    // Preload shared refs and add them to AJV so $ref resolves locally.
-    const sharedUrls = [
-      `${SCHEMA_HOST}/schemas/v1.0.0/_shared/receipt.base.schema.json`,
-      `${SCHEMA_HOST}/schemas/v1.0.0/_shared/x402.schema.json`,
-      `${SCHEMA_HOST}/schemas/v1.0.0/_shared/identity.schema.json`,
-    ];
-
-    const sharedSchemas = await Promise.all(sharedUrls.map((u) => fetchJsonWithTimeout(u, SCHEMA_FETCH_TIMEOUT_MS)));
-    for (const sch of sharedSchemas) {
-      if (sch && sch.$id) ajv.addSchema(sch, sch.$id);
+    // Preload shared refs (helps AJV in practice and avoids host mismatch surprises)
+    try {
+      const shared = [
+        `${SCHEMA_HOST}/schemas/v1.0.0/_shared/receipt.base.schema.json`,
+        `${SCHEMA_HOST}/schemas/v1.0.0/_shared/x402.schema.json`,
+        `${SCHEMA_HOST}/schemas/v1.0.0/_shared/identity.schema.json`,
+      ];
+      await Promise.all(shared.map((u) => fetchJsonWithTimeout(u, SCHEMA_FETCH_TIMEOUT_MS).catch(() => null)));
+    } catch {
+      // ignore
     }
 
-    const receiptSchema = await fetchJsonWithTimeout(receiptUrl, SCHEMA_FETCH_TIMEOUT_MS);
-    if (receiptSchema && receiptSchema.$id) ajv.addSchema(receiptSchema, receiptSchema.$id);
-
-    // Compile synchronously (avoids compileAsync hanging on ref resolution)
-    const validate = await withTimeout(
-      Promise.resolve(ajv.compile(receiptSchema)),
-      SCHEMA_VALIDATE_BUDGET_MS,
-      "ajv_compile_budget_exceeded"
-    );
-
+    const schema = await fetchJsonWithTimeout(url, SCHEMA_FETCH_TIMEOUT_MS);
+    const compilePromise = ajv.compileAsync(schema);
+    const validate = await withTimeout(compilePromise, SCHEMA_VALIDATE_BUDGET_MS, "ajv_compile_budget_exceeded");
     validatorCache.set(verb, { compiledAt: Date.now(), validate });
     return validate;
   })().finally(() => inflightValidator.delete(verb));
@@ -391,16 +399,18 @@ function makeReceipt({ x402, trace, result, status = "success", error = null, de
         hash_sha256: null,
         signature_b64: null,
       },
-      receipt_id: "",
+      receipt_id: "", // IMPORTANT: exists during hashing but blanked
     },
   };
 
+  // Optional: actor semantics in metadata without touching v1.0.0 schemas
   if (actor) receipt.metadata.actor = actor;
 
+  // hash/sign after building receipt but BEFORE inserting signature/hash
   const unsigned = structuredClone(receipt);
   unsigned.metadata.proof.hash_sha256 = "";
   unsigned.metadata.proof.signature_b64 = "";
-  unsigned.metadata.receipt_id = "";
+  unsigned.metadata.receipt_id = ""; // exclude receipt_id from canonical hash
 
   const canonical = stableStringify(unsigned);
   const hash = sha256Hex(canonical);
@@ -408,6 +418,8 @@ function makeReceipt({ x402, trace, result, status = "success", error = null, de
 
   receipt.metadata.proof.hash_sha256 = hash;
   receipt.metadata.proof.signature_b64 = sigB64;
+
+  // Deterministic receipt identifier stored in metadata (does not affect hash)
   receipt.metadata.receipt_id = hash;
 
   return receipt;
@@ -431,6 +443,7 @@ async function doFetch(body) {
     clearTimeout(t);
   }
 
+  // stream and cap bytes (prevents OOM + huge responses)
   const reader = resp.body?.getReader?.();
   let received = 0;
   const chunks = [];
@@ -484,7 +497,12 @@ function doDescribe(body) {
   return {
     description,
     bullets,
-    properties: { verb: "describe", version: "1.0.0", audience, detail_level: detail },
+    properties: {
+      verb: "describe",
+      version: "1.0.0",
+      audience,
+      detail_level: detail,
+    },
   };
 }
 
@@ -495,7 +513,6 @@ function doFormat(body) {
   if (!content.trim()) throw new Error("format.input.content required");
   let formatted = content;
   let style = target;
-
   if (target === "table") {
     const lines = content
       .split(/\r?\n/)
@@ -509,7 +526,6 @@ function doFormat(body) {
     formatted = `| key | value |\n|---|---|\n` + rows.map(([k, v]) => `| ${k} | ${v} |`).join("\n");
     style = "table";
   }
-
   return {
     formatted_content: formatted,
     style,
@@ -525,7 +541,6 @@ function doClean(body) {
   if (!content) throw new Error("clean.input.content required");
   const ops = Array.isArray(input.operations) ? input.operations : [];
   const issues = [];
-
   const apply = (op) => {
     if (op === "normalize_newlines") content = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
     if (op === "collapse_whitespace") content = content.replace(/[ \t]+/g, " ");
@@ -537,9 +552,7 @@ function doClean(body) {
       if (content !== before) issues.push("emails_redacted");
     }
   };
-
   for (const op of ops) apply(op);
-
   return {
     cleaned_content: content,
     original_length: String(input.content ?? "").length,
@@ -619,7 +632,12 @@ function doSummarize(body) {
   const srcHash = sha256Hex(content);
   const cr = summary.length ? Number((content.length / summary.length).toFixed(3)) : 0;
 
-  return { summary, format: format === "markdown" ? "markdown" : "text", compression_ratio: cr, source_hash: srcHash };
+  return {
+    summary,
+    format: format === "markdown" ? "markdown" : "text",
+    compression_ratio: cr,
+    source_hash: srcHash,
+  };
 }
 
 function doConvert(body) {
@@ -655,7 +673,13 @@ function doConvert(body) {
     warnings.push(`No deterministic converter for ${src}->${tgt}; echoing content.`);
   }
 
-  return { converted_content: converted, source_format: src, target_format: tgt, lossy, warnings };
+  return {
+    converted_content: converted,
+    source_format: src,
+    target_format: tgt,
+    lossy,
+    warnings,
+  };
 }
 
 function doExplain(body) {
@@ -781,7 +805,11 @@ function doClassify(body) {
   const trimmedLabels = labels.slice(0, Math.min(128, maxLabels));
   const trimmedScores = scores.slice(0, trimmedLabels.length);
 
-  return { labels: trimmedLabels, scores: trimmedScores, taxonomy: ["root", trimmedLabels[0] || "general"] };
+  return {
+    labels: trimmedLabels,
+    scores: trimmedScores,
+    taxonomy: ["root", trimmedLabels[0] || "general"],
+  };
 }
 
 // Router: dispatch by verb
@@ -803,9 +831,16 @@ async function handleVerb(verb, req, res) {
   if (!requireBody(req, res)) return;
 
   const started = Date.now();
+
+  // FIX: only include parent_trace_id if it's a real string (schema requires string, not null)
+  const parent =
+    req.body?.trace?.parent_trace_id ||
+    req.body?.x402?.extras?.parent_trace_id ||
+    null;
+
   const trace = {
     trace_id: randId("trace_"),
-    parent_trace_id: req.body?.trace?.parent_trace_id || req.body?.x402?.extras?.parent_trace_id || null,
+    ...(parent ? { parent_trace_id: String(parent) } : {}),
     started_at: nowIso(),
     completed_at: null,
     duration_ms: null,
@@ -816,7 +851,10 @@ async function handleVerb(verb, req, res) {
     const x402 = req.body?.x402 || { verb, version: "1.0.0", entry: `x402://${verb}agent.eth/${verb}/v1.0.0` };
 
     const callerTimeout = Number(req.body?.limits?.timeout_ms || req.body?.limits?.max_latency_ms || 0);
-    const timeoutMs = Math.min(SERVER_MAX_HANDLER_MS, callerTimeout && callerTimeout > 0 ? callerTimeout : SERVER_MAX_HANDLER_MS);
+    const timeoutMs = Math.min(
+      SERVER_MAX_HANDLER_MS,
+      callerTimeout && callerTimeout > 0 ? callerTimeout : SERVER_MAX_HANDLER_MS
+    );
 
     const work = Promise.resolve(handlers[verb](req.body));
     const result = timeoutMs
@@ -838,6 +876,7 @@ async function handleVerb(verb, req, res) {
     trace.completed_at = nowIso();
     trace.duration_ms = Date.now() - started;
 
+    // BIG FIX: schema-legal error receipt (receipt.base compatible)
     const x402 = req.body?.x402 || { verb, version: "1.0.0", entry: `x402://${verb}agent.eth/${verb}/v1.0.0` };
 
     const actor = req.body?.actor
@@ -917,6 +956,7 @@ app.get("/debug/env", (req, res) => {
     schema_host: SCHEMA_HOST,
     schema_fetch_timeout_ms: SCHEMA_FETCH_TIMEOUT_MS,
     schema_validate_budget_ms: SCHEMA_VALIDATE_BUDGET_MS,
+
     enable_ssrf_guard: ENABLE_SSRF_GUARD,
     fetch_timeout_ms: FETCH_TIMEOUT_MS,
     fetch_max_bytes: FETCH_MAX_BYTES,
@@ -928,6 +968,7 @@ app.get("/debug/env", (req, res) => {
       validator_cache_ttl_ms: VALIDATOR_CACHE_TTL_MS,
     },
     server_max_handler_ms: SERVER_MAX_HANDLER_MS,
+
     service_name: SERVICE_NAME,
     service_version: SERVICE_VERSION,
     api_version: API_VERSION,
@@ -981,24 +1022,6 @@ app.get("/debug/routes", (req, res) => {
   res.json({ ok: true, count: routes.length, routes });
 });
 
-// NEW: warm schema validators so schema=1 verify doesn't cold-start timeout
-app.post("/debug/prewarm", async (req, res) => {
-  if (!req.body || typeof req.body !== "object") return res.status(400).json({ ok: false, error: "Invalid JSON body" });
-  const verbs = Array.isArray(req.body?.verbs) ? req.body.verbs.map(String) : [];
-  if (!verbs.length) return res.status(400).json({ ok: false, error: "provide {verbs:[...]}" });
-
-  const results = [];
-  for (const v of verbs) {
-    try {
-      await getValidatorForVerb(v);
-      results.push({ verb: v, ok: true });
-    } catch (e) {
-      results.push({ verb: v, ok: false, error: e?.message || String(e) });
-    }
-  }
-  res.json({ ok: results.every((r) => r.ok), results });
-});
-
 // -----------------------
 // verb routes: /<verb>/v1.0.0
 // -----------------------
@@ -1007,8 +1030,13 @@ for (const v of Object.keys(handlers)) {
 }
 
 // -----------------------
-// verify endpoint
+// verify endpoint (supports schema validation + ENS pubkey)
 // -----------------------
+// Query params:
+//   ens=1      -> try to fetch pubkey from ENS (fallback to env if present)
+//   refresh=1  -> refresh ENS cache
+//   schema=1   -> validate receipt against published JSON schema (AJV)
+// Default: schema=0 (off) so verify never 502s.
 app.post("/verify", async (req, res) => {
   const work = (async () => {
     const receipt = req.body;
@@ -1044,7 +1072,7 @@ app.post("/verify", async (req, res) => {
       const unsigned = structuredClone(receipt);
       unsigned.metadata.proof.hash_sha256 = "";
       unsigned.metadata.proof.signature_b64 = "";
-      if (unsigned?.metadata) unsigned.metadata.receipt_id = "";
+      if (unsigned?.metadata) unsigned.metadata.receipt_id = ""; // IMPORTANT: exclude receipt_id
       const canonical = stableStringify(unsigned);
       const recomputed = sha256Hex(canonical);
 
@@ -1101,7 +1129,11 @@ app.post("/verify", async (req, res) => {
 
       return res.json({
         ok: hashMatches && sigOk && schemaOk,
-        checks: { schema_valid: schemaOk, hash_matches: hashMatches, signature_valid: sigOk },
+        checks: {
+          schema_valid: schemaOk,
+          hash_matches: hashMatches,
+          signature_valid: sigOk,
+        },
         values: {
           verb: receipt?.x402?.verb ?? null,
           signer_id: proof.signer_id ?? null,
@@ -1111,7 +1143,10 @@ app.post("/verify", async (req, res) => {
           recomputed_hash: recomputed,
           pubkey_source: pubSrc,
         },
-        errors: { schema_errors: schemaErrors, signature_error: sigErr },
+        errors: {
+          schema_errors: schemaErrors,
+          signature_error: sigErr,
+        },
       });
     } catch (e) {
       return res.status(500).json({
