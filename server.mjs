@@ -336,18 +336,16 @@ async function getValidatorForVerb(verb) {
     tsField: "compiledAt",
   });
 
-  // cache hit
   const hit = validatorCache.get(verb);
   if (hit?.validate) return hit.validate;
 
-  // inflight dedupe
   if (inflightValidator.has(verb)) return await inflightValidator.get(verb);
 
   const build = (async () => {
     const ajv = makeAjv();
     const url = receiptSchemaUrlForVerb(verb);
 
-    // Preload shared refs (helps AJV in practice and avoids host mismatch surprises)
+    // Preload shared refs
     try {
       const shared = [
         `${SCHEMA_HOST}/schemas/v1.0.0/_shared/receipt.base.schema.json`,
@@ -403,10 +401,8 @@ function makeReceipt({ x402, trace, result, status = "success", error = null, de
     },
   };
 
-  // Optional: actor semantics in metadata without touching v1.0.0 schemas
   if (actor) receipt.metadata.actor = actor;
 
-  // hash/sign after building receipt but BEFORE inserting signature/hash
   const unsigned = structuredClone(receipt);
   unsigned.metadata.proof.hash_sha256 = "";
   unsigned.metadata.proof.signature_b64 = "";
@@ -418,8 +414,6 @@ function makeReceipt({ x402, trace, result, status = "success", error = null, de
 
   receipt.metadata.proof.hash_sha256 = hash;
   receipt.metadata.proof.signature_b64 = sigB64;
-
-  // Deterministic receipt identifier stored in metadata (does not affect hash)
   receipt.metadata.receipt_id = hash;
 
   return receipt;
@@ -443,7 +437,6 @@ async function doFetch(body) {
     clearTimeout(t);
   }
 
-  // stream and cap bytes (prevents OOM + huge responses)
   const reader = resp.body?.getReader?.();
   let received = 0;
   const chunks = [];
@@ -707,7 +700,8 @@ function doExplain(body) {
 
   let explanation = "";
   if (audience === "novice") {
-    explanation = `**${subject}** are like “tamper-proof receipts” for agent actions.\n\n` + core.map((s) => `- ${s}`).join("\n");
+    explanation =
+      `**${subject}** are like “tamper-proof receipts” for agent actions.\n\n` + core.map((s) => `- ${s}`).join("\n");
   } else {
     explanation =
       `**${subject}** are cryptographically verifiable execution artifacts that bind intent (verb+version), semantics (schema), and output into a signed proof.\n\n` +
@@ -832,15 +826,15 @@ async function handleVerb(verb, req, res) {
 
   const started = Date.now();
 
-  // FIX: only include parent_trace_id if it's a real string (schema requires string, not null)
-  const parent =
-    req.body?.trace?.parent_trace_id ||
-    req.body?.x402?.extras?.parent_trace_id ||
-    null;
+  // FIX (schema): only include parent_trace_id if it is a non-empty string.
+  // Published schemas require `trace.parent_trace_id` to be a string when present (not null).
+  const rawParent = req.body?.trace?.parent_trace_id ?? req.body?.x402?.extras?.parent_trace_id ?? null;
+  const parentTraceId =
+    typeof rawParent === "string" && rawParent.trim().length ? rawParent.trim() : null;
 
   const trace = {
     trace_id: randId("trace_"),
-    ...(parent ? { parent_trace_id: String(parent) } : {}),
+    ...(parentTraceId ? { parent_trace_id: parentTraceId } : {}),
     started_at: nowIso(),
     completed_at: null,
     duration_ms: null,
@@ -876,7 +870,6 @@ async function handleVerb(verb, req, res) {
     trace.completed_at = nowIso();
     trace.duration_ms = Date.now() - started;
 
-    // BIG FIX: schema-legal error receipt (receipt.base compatible)
     const x402 = req.body?.x402 || { verb, version: "1.0.0", entry: `x402://${verb}agent.eth/${verb}/v1.0.0` };
 
     const actor = req.body?.actor
@@ -1032,11 +1025,6 @@ for (const v of Object.keys(handlers)) {
 // -----------------------
 // verify endpoint (supports schema validation + ENS pubkey)
 // -----------------------
-// Query params:
-//   ens=1      -> try to fetch pubkey from ENS (fallback to env if present)
-//   refresh=1  -> refresh ENS cache
-//   schema=1   -> validate receipt against published JSON schema (AJV)
-// Default: schema=0 (off) so verify never 502s.
 app.post("/verify", async (req, res) => {
   const work = (async () => {
     const receipt = req.body;
