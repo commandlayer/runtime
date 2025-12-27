@@ -1,4 +1,10 @@
-// server.mjs
+// server.mjs — “finally works” edition
+// Goals:
+// 1) NEVER 502 on /verify?schema=1 or /debug/prewarm (edge-safe, returns fast)
+// 2) Schema validation works once warmed (cached validator), otherwise returns 202 + queues warm
+// 3) ENS pubkey verify stays bounded by VERIFY_MAX_MS
+// 4) Receipt hashing/signing deterministic and schema-legal (no null parent_trace_id)
+
 import express from "express";
 import crypto from "crypto";
 import Ajv from "ajv";
@@ -9,7 +15,7 @@ import net from "net";
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// ---- basic CORS (no dependency)
+// ---- basic CORS
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -21,7 +27,8 @@ app.use((req, res, next) => {
 const PORT = Number(process.env.PORT || 8080);
 
 // ---- runtime config
-const ENABLED_VERBS = (process.env.ENABLED_VERBS || "fetch")
+const ENABLED_VERBS = (process.env.ENABLED_VERBS ||
+  "fetch,describe,format,clean,parse,summarize,convert,explain,analyze,classify")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -30,35 +37,32 @@ const SIGNER_ID = process.env.RECEIPT_SIGNER_ID || process.env.ENS_NAME || "runt
 const PRIV_PEM_B64 = process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64 || "";
 const PUB_PEM_B64 = process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "";
 
-// ---- service identity / discovery
+// ---- service identity
 const SERVICE_NAME = process.env.SERVICE_NAME || "commandlayer-runtime";
 const SERVICE_VERSION = process.env.SERVICE_VERSION || "1.0.0";
-// Canonical base for humans (set this in Railway to https://runtime.commandlayer.org)
-const CANONICAL_BASE = (process.env.CANONICAL_BASE_URL || "https://runtime.commandlayer.org").replace(/\/+$/, "");
-// Path version used in routes: "/<verb>/v1.0.0"
 const API_VERSION = process.env.API_VERSION || "1.0.0";
+const CANONICAL_BASE = (process.env.CANONICAL_BASE_URL || "https://runtime.commandlayer.org").replace(/\/+$/, "");
 
-// ENS verifier config
+// ---- ENS verifier config
 const ETH_RPC_URL = process.env.ETH_RPC_URL || "";
 const VERIFIER_ENS_NAME = process.env.VERIFIER_ENS_NAME || process.env.ENS_NAME || SIGNER_ID || "";
 const ENS_PUBKEY_TEXT_KEY = process.env.ENS_PUBKEY_TEXT_KEY || "cl.receipt.pubkey.pem";
 
-// IMPORTANT: AJV should fetch schemas from www, but schemas' $id/refs may be commandlayer.org.
-// We normalize fetch URLs to https://www.commandlayer.org to avoid redirect/host mismatches.
+// ---- schema config
 const SCHEMA_HOST = (process.env.SCHEMA_HOST || "https://www.commandlayer.org").replace(/\/+$/, "");
-const SCHEMA_FETCH_TIMEOUT_MS = Number(process.env.SCHEMA_FETCH_TIMEOUT_MS || 8000);
-const SCHEMA_VALIDATE_BUDGET_MS = Number(process.env.SCHEMA_VALIDATE_BUDGET_MS || 3500);
+const SCHEMA_FETCH_TIMEOUT_MS = Number(process.env.SCHEMA_FETCH_TIMEOUT_MS || 15000);
+const SCHEMA_VALIDATE_BUDGET_MS = Number(process.env.SCHEMA_VALIDATE_BUDGET_MS || 15000);
 
-// ---- scaling + safety knobs (server-side caps)
+// ---- caches + budgets
 const MAX_JSON_CACHE_ENTRIES = Number(process.env.MAX_JSON_CACHE_ENTRIES || 256);
 const JSON_CACHE_TTL_MS = Number(process.env.JSON_CACHE_TTL_MS || 10 * 60 * 1000);
 const MAX_VALIDATOR_CACHE_ENTRIES = Number(process.env.MAX_VALIDATOR_CACHE_ENTRIES || 128);
 const VALIDATOR_CACHE_TTL_MS = Number(process.env.VALIDATOR_CACHE_TTL_MS || 30 * 60 * 1000);
-const SERVER_MAX_HANDLER_MS = Number(process.env.SERVER_MAX_HANDLER_MS || 12000); // hard cap even if caller doesn't set limits
+const SERVER_MAX_HANDLER_MS = Number(process.env.SERVER_MAX_HANDLER_MS || 12000);
 
 // fetch hardening
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 8000);
-const FETCH_MAX_BYTES = Number(process.env.FETCH_MAX_BYTES || 256 * 1024); // cap preview + protect memory
+const FETCH_MAX_BYTES = Number(process.env.FETCH_MAX_BYTES || 256 * 1024);
 const ENABLE_SSRF_GUARD = String(process.env.ENABLE_SSRF_GUARD || "1") === "1";
 const ALLOW_FETCH_HOSTS = (process.env.ALLOW_FETCH_HOSTS || "")
   .split(",")
@@ -66,13 +70,14 @@ const ALLOW_FETCH_HOSTS = (process.env.ALLOW_FETCH_HOSTS || "")
   .filter(Boolean);
 
 // verify hardening
-const VERIFY_MAX_MS = Number(process.env.VERIFY_MAX_MS || 8000);
+const VERIFY_MAX_MS = Number(process.env.VERIFY_MAX_MS || 30000);
 
-// schema-safe verify behavior:
-// - NEVER compile validators inside /verify (avoids Railway 502 timeouts)
-// - if schema=1 and validator isn't cached yet: return 202 quickly (warming required)
+// CRITICAL: to stop Railway edge 502s,
+// /verify?schema=1 never compiles/fetches — only uses cached validators.
+// Missing validator => 202 + queue warm.
 const VERIFY_SCHEMA_CACHED_ONLY = String(process.env.VERIFY_SCHEMA_CACHED_ONLY || "1") === "1";
-// /debug/prewarm will warm sequentially. Limit verbs and budgets.
+
+// prewarm limits
 const PREWARM_MAX_VERBS = Number(process.env.PREWARM_MAX_VERBS || 25);
 const PREWARM_TOTAL_BUDGET_MS = Number(process.env.PREWARM_TOTAL_BUDGET_MS || 12000);
 const PREWARM_PER_VERB_BUDGET_MS = Number(process.env.PREWARM_PER_VERB_BUDGET_MS || 5000);
@@ -80,12 +85,24 @@ const PREWARM_PER_VERB_BUDGET_MS = Number(process.env.PREWARM_PER_VERB_BUDGET_MS
 function nowIso() {
   return new Date().toISOString();
 }
-
 function randId(prefix = "trace_") {
   return prefix + crypto.randomBytes(6).toString("hex");
 }
+function sha256Hex(str) {
+  return crypto.createHash("sha256").update(str).digest("hex");
+}
+function pemFromB64(b64) {
+  if (!b64) return null;
+  const pem = Buffer.from(b64, "base64").toString("utf8");
+  return pem.includes("BEGIN") ? pem : null;
+}
+function normalizePem(text) {
+  if (!text) return null;
+  const pem = String(text).replace(/\\n/g, "\n").trim();
+  return pem.includes("BEGIN") ? pem : null;
+}
 
-// Stable stringify (deterministic object key order)
+// deterministic stringify (sorted keys)
 function stableStringify(value) {
   const seen = new WeakSet();
   const helper = (v) => {
@@ -100,45 +117,23 @@ function stableStringify(value) {
   return JSON.stringify(helper(value));
 }
 
-function sha256Hex(str) {
-  return crypto.createHash("sha256").update(str).digest("hex");
-}
-
-function pemFromB64(b64) {
-  if (!b64) return null;
-  const pem = Buffer.from(b64, "base64").toString("utf8");
-  return pem.includes("BEGIN") ? pem : null;
-}
-
-function normalizePem(text) {
-  if (!text) return null;
-  // Handle ENS records that store "\n" escaped
-  const pem = String(text).replace(/\\n/g, "\n").trim();
-  return pem.includes("BEGIN") ? pem : null;
-}
-
 function signEd25519Base64(messageUtf8) {
   const pem = pemFromB64(PRIV_PEM_B64);
   if (!pem) throw new Error("Missing RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64");
   const key = crypto.createPrivateKey(pem);
-  // For Ed25519: algorithm is null
   const sig = crypto.sign(null, Buffer.from(messageUtf8, "utf8"), key);
   return sig.toString("base64");
 }
-
 function verifyEd25519Base64(messageUtf8, signatureB64, pubPem) {
   const key = crypto.createPublicKey(pubPem);
   return crypto.verify(null, Buffer.from(messageUtf8, "utf8"), key, Buffer.from(signatureB64, "base64"));
 }
-
 function makeError(code, message, extra = {}) {
   return { status: "error", code, message, ...extra };
 }
-
 function enabled(verb) {
   return ENABLED_VERBS.includes(verb);
 }
-
 function requireBody(req, res) {
   if (!req.body || typeof req.body !== "object") {
     res.status(400).json(makeError(400, "Invalid JSON body"));
@@ -146,28 +141,28 @@ function requireBody(req, res) {
   }
   return true;
 }
+async function withTimeout(promise, ms, label = "timeout") {
+  if (!ms || ms <= 0) return await promise;
+  return await Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error(label)), ms))]);
+}
 
 // -----------------------
 // SSRF guard for fetch()
 // -----------------------
 function isPrivateIp(ip) {
-  // ipv4 only guard (good enough to kill the common SSRF abuse paths)
   if (!net.isIP(ip)) return false;
-  if (net.isIP(ip) === 6) return true; // treat ipv6 as blocked unless you add explicit handling
-  const parts = ip.split(".").map((n) => Number(n));
-  const [a, b] = parts;
+  if (net.isIP(ip) === 6) return true; // block ipv6 (simple)
+  const [a, b] = ip.split(".").map((n) => Number(n));
   if (a === 10) return true;
   if (a === 127) return true;
   if (a === 169 && b === 254) return true;
   if (a === 172 && b >= 16 && b <= 31) return true;
   if (a === 192 && b === 168) return true;
   if (a === 0) return true;
-  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+  if (a === 100 && b >= 64 && b <= 127) return true;
   return false;
 }
-
 async function resolveARecords(hostname) {
-  // Avoid extra deps; use global DNS via node's built-in resolver
   const dns = await import("dns/promises");
   try {
     const addrs = await dns.resolve4(hostname);
@@ -176,7 +171,6 @@ async function resolveARecords(hostname) {
     return [];
   }
 }
-
 async function ssrfGuardOrThrow(urlStr) {
   if (!ENABLE_SSRF_GUARD) return;
   let u;
@@ -188,42 +182,26 @@ async function ssrfGuardOrThrow(urlStr) {
   if (!/^https?:$/.test(u.protocol)) throw new Error("fetch only allows http(s)");
   const host = (u.hostname || "").toLowerCase();
 
-  // Optional allowlist (strongest)
   if (ALLOW_FETCH_HOSTS.length) {
     const ok = ALLOW_FETCH_HOSTS.some((h) => host === h || host.endsWith("." + h));
     if (!ok) throw new Error("fetch host not allowed");
   }
 
-  // Block obvious metadata targets
   if (host === "localhost" || host.endsWith(".localhost")) throw new Error("fetch host blocked");
   if (host === "169.254.169.254") throw new Error("fetch host blocked");
-
-  // Block direct IPs in private ranges
   if (net.isIP(host) && isPrivateIp(host)) throw new Error("fetch to private IP blocked");
 
-  // Block DNS that resolves to private IPs
   const addrs = await resolveARecords(host);
   if (addrs.some(isPrivateIp)) throw new Error("fetch DNS resolves to private IP (blocked)");
 }
 
 // -----------------------
-// ENS TXT pubkey fetch (ethers v6)
+// ENS pubkey fetch (cached)
 // -----------------------
-let ensCache = {
-  fetched_at: 0,
-  ttl_ms: 10 * 60 * 1000,
-  pem: null,
-  error: null,
-  source: null,
-};
+let ensCache = { fetched_at: 0, ttl_ms: 10 * 60 * 1000, pem: null, error: null, source: null };
 
 function hasRpc() {
   return !!ETH_RPC_URL;
-}
-
-async function withTimeout(promise, ms, label = "timeout") {
-  if (!ms || ms <= 0) return await promise;
-  return await Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error(label)), ms))]);
 }
 
 async function fetchEnsPubkeyPem({ refresh = false } = {}) {
@@ -255,7 +233,7 @@ async function fetchEnsPubkeyPem({ refresh = false } = {}) {
 }
 
 // -----------------------
-// AJV schema validation (with safe time budgets)
+// AJV schema validation (caches)
 // -----------------------
 const schemaJsonCache = new Map(); // url -> { fetchedAt, schema }
 const validatorCache = new Map(); // verb -> { compiledAt, validate }
@@ -270,12 +248,7 @@ function cachePrune(map, { ttlMs, maxEntries, tsField = "fetchedAt" } = {}) {
     }
   }
   if (maxEntries && maxEntries > 0 && map.size > maxEntries) {
-    // delete oldest
-    const entries = Array.from(map.entries()).sort((a, b) => {
-      const ta = a[1]?.[tsField] || 0;
-      const tb = b[1]?.[tsField] || 0;
-      return ta - tb;
-    });
+    const entries = Array.from(map.entries()).sort((a, b) => (a[1]?.[tsField] || 0) - (b[1]?.[tsField] || 0));
     const toDelete = entries.slice(0, map.size - maxEntries);
     for (const [k] of toDelete) map.delete(k);
   }
@@ -287,9 +260,6 @@ function normalizeSchemaFetchUrl(url) {
   u = u.replace(/^http:\/\//i, "https://");
   u = u.replace(/^https:\/\/commandlayer\.org/i, "https://www.commandlayer.org");
   u = u.replace(/^https:\/\/www\.commandlayer\.org\/+/, "https://www.commandlayer.org/");
-  if (SCHEMA_HOST.startsWith("https://www.commandlayer.org")) {
-    u = u.replace(/^https:\/\/commandlayer\.org/i, "https://www.commandlayer.org");
-  }
   return u;
 }
 
@@ -334,7 +304,11 @@ function receiptSchemaUrlForVerb(verb) {
   return `${SCHEMA_HOST}/schemas/v1.0.0/commons/${verb}/receipts/${verb}.receipt.schema.json`;
 }
 
-async function buildValidatorForVerb(verb) {
+function hasValidatorCached(verb) {
+  return !!validatorCache.get(verb)?.validate;
+}
+
+async function getValidatorForVerb(verb) {
   cachePrune(validatorCache, {
     ttlMs: VALIDATOR_CACHE_TTL_MS,
     maxEntries: MAX_VALIDATOR_CACHE_ENTRIES,
@@ -358,31 +332,16 @@ async function buildValidatorForVerb(verb) {
         `${SCHEMA_HOST}/schemas/v1.0.0/_shared/identity.schema.json`,
       ];
       await Promise.all(shared.map((u) => fetchJsonWithTimeout(u, SCHEMA_FETCH_TIMEOUT_MS).catch(() => null)));
-    } catch {
-      // ignore
-    }
+    } catch {}
 
     const schema = await fetchJsonWithTimeout(url, SCHEMA_FETCH_TIMEOUT_MS);
-    const compilePromise = ajv.compileAsync(schema);
-
-    // IMPORTANT: compile can take long. Budget it.
-    const validate = await withTimeout(compilePromise, SCHEMA_VALIDATE_BUDGET_MS, "ajv_compile_budget_exceeded");
+    const validate = await withTimeout(ajv.compileAsync(schema), SCHEMA_VALIDATE_BUDGET_MS, "ajv_compile_budget_exceeded");
     validatorCache.set(verb, { compiledAt: Date.now(), validate });
     return validate;
   })().finally(() => inflightValidator.delete(verb));
 
   inflightValidator.set(verb, build);
   return await build;
-}
-
-// cached-only check used by /verify
-function getValidatorIfCached(verb) {
-  cachePrune(validatorCache, {
-    ttlMs: VALIDATOR_CACHE_TTL_MS,
-    maxEntries: MAX_VALIDATOR_CACHE_ENTRIES,
-    tsField: "compiledAt",
-  });
-  return validatorCache.get(verb)?.validate || null;
 }
 
 function ajvErrorsToSimple(errors) {
@@ -396,7 +355,52 @@ function ajvErrorsToSimple(errors) {
 }
 
 // -----------------------
-// receipts (receipt_id excluded from hash)
+// Background warm queue (edge-safe)
+// -----------------------
+const warmQueue = new Set();
+let warmRunning = false;
+
+function queueWarm(verbs) {
+  for (const v of verbs) {
+    if (!v) continue;
+    if (!handlers[v]) continue;
+    if (hasValidatorCached(v)) continue;
+    warmQueue.add(v);
+  }
+  startWarmWorker();
+}
+
+function startWarmWorker() {
+  if (warmRunning) return;
+  warmRunning = true;
+
+  setTimeout(async () => {
+    const started = Date.now();
+    try {
+      while (warmQueue.size > 0) {
+        if (Date.now() - started > PREWARM_TOTAL_BUDGET_MS) break;
+
+        const verb = warmQueue.values().next().value;
+        warmQueue.delete(verb);
+
+        if (!verb) continue;
+        if (hasValidatorCached(verb)) continue;
+
+        try {
+          await withTimeout(getValidatorForVerb(verb), PREWARM_PER_VERB_BUDGET_MS, "prewarm_per_verb_timeout");
+        } catch {
+          // swallow
+        }
+      }
+    } finally {
+      warmRunning = false;
+      if (warmQueue.size > 0) startWarmWorker();
+    }
+  }, 0);
+}
+
+// -----------------------
+// Receipts (exclude receipt_id from canonical hash)
 // -----------------------
 function makeReceipt({ x402, trace, result, status = "success", error = null, delegation_result = null, actor = null }) {
   const receipt = {
@@ -432,7 +436,6 @@ function makeReceipt({ x402, trace, result, status = "success", error = null, de
   receipt.metadata.proof.hash_sha256 = hash;
   receipt.metadata.proof.signature_b64 = sigB64;
   receipt.metadata.receipt_id = hash;
-
   return receipt;
 }
 
@@ -442,7 +445,6 @@ function makeReceipt({ x402, trace, result, status = "success", error = null, de
 async function doFetch(body) {
   const url = body?.source || body?.input?.source || body?.input?.url;
   if (!url || typeof url !== "string") throw new Error("fetch requires source (url)");
-
   await ssrfGuardOrThrow(url);
 
   const ac = new AbortController();
@@ -504,16 +506,7 @@ function doDescribe(body) {
     detail === "short"
       ? `**${subject}** is a standard “API meaning” contract agents can call using published schemas and receipts.`
       : `**${subject}** is a semantic contract for agents. It standardizes verbs, strict JSON Schemas (requests + receipts), and verifiable receipts so different runtimes can execute the same intent without semantic drift.`;
-  return {
-    description,
-    bullets,
-    properties: {
-      verb: "describe",
-      version: "1.0.0",
-      audience,
-      detail_level: detail,
-    },
-  };
+  return { description, bullets, properties: { verb: "describe", version: "1.0.0", audience, detail_level: detail } };
 }
 
 function doFormat(body) {
@@ -642,12 +635,7 @@ function doSummarize(body) {
   const srcHash = sha256Hex(content);
   const cr = summary.length ? Number((content.length / summary.length).toFixed(3)) : 0;
 
-  return {
-    summary,
-    format: format === "markdown" ? "markdown" : "text",
-    compression_ratio: cr,
-    source_hash: srcHash,
-  };
+  return { summary, format: format === "markdown" ? "markdown" : "text", compression_ratio: cr, source_hash: srcHash };
 }
 
 function doConvert(body) {
@@ -683,13 +671,7 @@ function doConvert(body) {
     warnings.push(`No deterministic converter for ${src}->${tgt}; echoing content.`);
   }
 
-  return {
-    converted_content: converted,
-    source_format: src,
-    target_format: tgt,
-    lossy,
-    warnings,
-  };
+  return { converted_content: converted, source_format: src, target_format: tgt, lossy, warnings };
 }
 
 function doExplain(body) {
@@ -717,8 +699,7 @@ function doExplain(body) {
 
   let explanation = "";
   if (audience === "novice") {
-    explanation =
-      `**${subject}** are like “tamper-proof receipts” for agent actions.\n\n` + core.map((s) => `- ${s}`).join("\n");
+    explanation = `**${subject}** are like “tamper-proof receipts” for agent actions.\n\n` + core.map((s) => `- ${s}`).join("\n");
   } else {
     explanation =
       `**${subject}** are cryptographically verifiable execution artifacts that bind intent (verb+version), semantics (schema), and output into a signed proof.\n\n` +
@@ -816,14 +797,9 @@ function doClassify(body) {
   const trimmedLabels = labels.slice(0, Math.min(128, maxLabels));
   const trimmedScores = scores.slice(0, trimmedLabels.length);
 
-  return {
-    labels: trimmedLabels,
-    scores: trimmedScores,
-    taxonomy: ["root", trimmedLabels[0] || "general"],
-  };
+  return { labels: trimmedLabels, scores: trimmedScores, taxonomy: ["root", trimmedLabels[0] || "general"] };
 }
 
-// Router: dispatch by verb
 const handlers = {
   fetch: doFetch,
   describe: async (b) => doDescribe(b),
@@ -843,7 +819,7 @@ async function handleVerb(verb, req, res) {
 
   const started = Date.now();
 
-  // FIX (schema): only include parent_trace_id if it is a non-empty string.
+  // parent_trace_id must be string if present; omit otherwise
   const rawParent = req.body?.trace?.parent_trace_id ?? req.body?.x402?.extras?.parent_trace_id ?? null;
   const parentTraceId = typeof rawParent === "string" && rawParent.trim().length ? rawParent.trim() : null;
 
@@ -853,7 +829,7 @@ async function handleVerb(verb, req, res) {
     started_at: nowIso(),
     completed_at: null,
     duration_ms: null,
-    provider: process.env.RAILWAY_SERVICE_NAME || "commandlayer-runtime",
+    provider: process.env.RAILWAY_SERVICE_NAME || "runtime",
   };
 
   try {
@@ -876,8 +852,7 @@ async function handleVerb(verb, req, res) {
       ? { id: String(req.body.x402.tenant), role: "tenant" }
       : null;
 
-    const receipt = makeReceipt({ x402, trace, result, status: "success", actor });
-    return res.json(receipt);
+    return res.json(makeReceipt({ x402, trace, result, status: "success", actor }));
   } catch (e) {
     trace.completed_at = nowIso();
     trace.duration_ms = Date.now() - started;
@@ -897,18 +872,17 @@ async function handleVerb(verb, req, res) {
       details: { verb },
     };
 
-    const receipt = makeReceipt({ x402, trace, status: "error", error: err, actor });
-    return res.status(500).json(receipt);
+    return res.status(500).json(makeReceipt({ x402, trace, status: "error", error: err, actor }));
   }
 }
 
 // -----------------------
-// health/index/debug
+// index/health/debug
 // -----------------------
 app.get("/", (req, res) => {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   const verbs = (ENABLED_VERBS || []).map((v) => `/${v}/v${API_VERSION}`);
-  return res.status(200).end(
+  res.status(200).end(
     JSON.stringify({
       ok: true,
       service: SERVICE_NAME,
@@ -927,7 +901,7 @@ app.get("/", (req, res) => {
 
 app.get("/health", (req, res) => {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
-  return res.status(200).end(
+  res.status(200).end(
     JSON.stringify({
       ok: true,
       service: SERVICE_NAME,
@@ -962,7 +936,6 @@ app.get("/debug/env", (req, res) => {
     schema_fetch_timeout_ms: SCHEMA_FETCH_TIMEOUT_MS,
     schema_validate_budget_ms: SCHEMA_VALIDATE_BUDGET_MS,
     verify_schema_cached_only: VERIFY_SCHEMA_CACHED_ONLY,
-
     enable_ssrf_guard: ENABLE_SSRF_GUARD,
     fetch_timeout_ms: FETCH_TIMEOUT_MS,
     fetch_max_bytes: FETCH_MAX_BYTES,
@@ -974,43 +947,11 @@ app.get("/debug/env", (req, res) => {
       validator_cache_ttl_ms: VALIDATOR_CACHE_TTL_MS,
     },
     server_max_handler_ms: SERVER_MAX_HANDLER_MS,
-
     prewarm: {
       max_verbs: PREWARM_MAX_VERBS,
       total_budget_ms: PREWARM_TOTAL_BUDGET_MS,
       per_verb_budget_ms: PREWARM_PER_VERB_BUDGET_MS,
     },
-
-    service_name: SERVICE_NAME,
-    service_version: SERVICE_VERSION,
-    api_version: API_VERSION,
-    canonical_base_url: CANONICAL_BASE,
-  });
-});
-
-app.get("/debug/enskey", async (req, res) => {
-  const refresh = String(req.query.refresh || "0") === "1";
-  const out = await fetchEnsPubkeyPem({ refresh });
-  res.json({
-    ok: !!out.ok,
-    pubkey_source: out.source || null,
-    ens_name: VERIFIER_ENS_NAME || null,
-    txt_key: ENS_PUBKEY_TEXT_KEY,
-    cache: out.cache ? { fetched_at: new Date(out.cache.fetched_at).toISOString(), ttl_ms: out.cache.ttl_ms } : null,
-    preview: out.pem ? out.pem.slice(0, 80) + "..." : null,
-    error: out.error || null,
-  });
-});
-
-app.get("/debug/schemafetch", (req, res) => {
-  const verb = String(req.query.verb || "").trim();
-  if (!verb) return res.status(400).json({ ok: false, error: "missing verb" });
-  const url = receiptSchemaUrlForVerb(verb);
-  res.json({
-    ok: true,
-    url,
-    id: `https://commandlayer.org/schemas/v1.0.0/commons/${verb}/receipts/${verb}.receipt.schema.json`,
-    hasRefs: true,
   });
 });
 
@@ -1018,70 +959,43 @@ app.get("/debug/validators", (req, res) => {
   res.json({
     ok: true,
     cached: Array.from(validatorCache.keys()),
+    cache_sizes: { schemaJsonCache: schemaJsonCache.size, validatorCache: validatorCache.size },
     inflight: Array.from(inflightValidator.keys()),
-    cache_sizes: { schemaJsonCache: schemaJsonCache.size, validatorCache: validatorCache.size },
+    warm_queue_size: warmQueue.size,
+    warm_running: warmRunning,
   });
 });
 
-// NEW: sequential prewarm that always returns quickly + never wedges the service
-app.post("/debug/prewarm", async (req, res) => {
-  const started = Date.now();
-  const body = req.body || {};
-  const verbsIn = Array.isArray(body.verbs) ? body.verbs.map((v) => String(v).trim()).filter(Boolean) : [];
-  const verbs = verbsIn.slice(0, PREWARM_MAX_VERBS);
+// EDGE-SAFE prewarm: respond immediately, warm after response
+app.post("/debug/prewarm", (req, res) => {
+  const verbs = Array.isArray(req.body?.verbs) ? req.body.verbs : [];
+  const cleaned = verbs
+    .map((v) => String(v || "").trim())
+    .filter(Boolean)
+    .slice(0, PREWARM_MAX_VERBS);
 
-  const results = [];
-  for (const verb of verbs) {
-    // respect total budget
-    if (Date.now() - started > PREWARM_TOTAL_BUDGET_MS) {
-      results.push({ verb, ok: false, warmed: false, error: "prewarm_total_budget_exceeded" });
-      continue;
-    }
+  const supported = cleaned.filter((v) => handlers[v]);
 
-    // already cached?
-    if (getValidatorIfCached(verb)) {
-      results.push({ verb, ok: true, warmed: true, cached: true });
-      continue;
-    }
+  queueWarm(supported);
 
-    try {
-      // warm sequentially with per-verb budget
-      await withTimeout(buildValidatorForVerb(verb), PREWARM_PER_VERB_BUDGET_MS, "prewarm_verb_budget_exceeded");
-      results.push({ verb, ok: true, warmed: true, cached: false });
-    } catch (e) {
-      results.push({ verb, ok: false, warmed: false, error: e?.message || "prewarm_failed" });
-    }
-  }
-
-  return res.json({
-    ok: results.every((r) => r.ok),
-    elapsed_ms: Date.now() - started,
-    results,
-    cache_sizes: { schemaJsonCache: schemaJsonCache.size, validatorCache: validatorCache.size },
+  res.json({
+    ok: true,
+    queued: supported,
+    already_cached: supported.filter(hasValidatorCached),
+    queue_size: warmQueue.size,
+    note: "Warming runs after response; poll /debug/validators for cached validators.",
   });
-});
-
-app.get("/debug/routes", (req, res) => {
-  const routes = [];
-  const stack = app?._router?.stack || [];
-  for (const layer of stack) {
-    if (layer?.route?.path) {
-      const methods = Object.keys(layer.route.methods || {}).filter(Boolean).join(",");
-      routes.push({ methods, path: layer.route.path });
-    }
-  }
-  res.json({ ok: true, count: routes.length, routes });
 });
 
 // -----------------------
-// verb routes: /<verb>/v1.0.0
+// verb routes
 // -----------------------
 for (const v of Object.keys(handlers)) {
   app.post(`/${v}/v1.0.0`, (req, res) => handleVerb(v, req, res));
 }
 
 // -----------------------
-// verify endpoint (supports schema validation + ENS pubkey)
+// verify endpoint (edge-safe schema validation)
 // -----------------------
 app.post("/verify", async (req, res) => {
   const work = (async () => {
@@ -1090,174 +1004,111 @@ app.post("/verify", async (req, res) => {
     const refresh = String(req.query.refresh || "0") === "1";
     const wantSchema = String(req.query.schema || "0") === "1";
 
-    const fail = (httpCode, message, patch = {}) => {
-      return res.status(httpCode).json({
+    const proof = receipt?.metadata?.proof;
+    if (!proof?.signature_b64 || !proof?.hash_sha256) {
+      return res.status(400).json({
         ok: false,
         checks: { schema_valid: false, hash_matches: false, signature_valid: false },
-        values: {
-          verb: receipt?.x402?.verb ?? null,
-          signer_id: receipt?.metadata?.proof?.signer_id ?? null,
-          alg: receipt?.metadata?.proof?.alg ?? null,
-          canonical: receipt?.metadata?.proof?.canonical ?? null,
-          claimed_hash: receipt?.metadata?.proof?.hash_sha256 ?? null,
-          recomputed_hash: null,
-          pubkey_source: null,
-        },
-        errors: { schema_errors: null, signature_error: message },
-        error: message,
-        ...patch,
-      });
-    };
-
-    try {
-      const proof = receipt?.metadata?.proof;
-      if (!proof?.signature_b64 || !proof?.hash_sha256) {
-        return fail(400, "missing metadata.proof.signature_b64 or hash_sha256");
-      }
-
-      const unsigned = structuredClone(receipt);
-      unsigned.metadata.proof.hash_sha256 = "";
-      unsigned.metadata.proof.signature_b64 = "";
-      if (unsigned?.metadata) unsigned.metadata.receipt_id = "";
-      const canonical = stableStringify(unsigned);
-      const recomputed = sha256Hex(canonical);
-
-      const hashMatches = recomputed === proof.hash_sha256;
-
-      let pubPem = pemFromB64(PUB_PEM_B64);
-      let pubSrc = pubPem ? "env-b64" : null;
-
-      if (wantEns) {
-        const ensOut = await fetchEnsPubkeyPem({ refresh });
-        if (ensOut.ok && ensOut.pem) {
-          pubPem = ensOut.pem;
-          pubSrc = "ens";
-        } else if (!pubPem) {
-          pubSrc = null;
-        }
-      }
-
-      let sigOk = false;
-      let sigErr = null;
-
-      if (pubPem) {
-        try {
-          sigOk = verifyEd25519Base64(proof.hash_sha256, proof.signature_b64, pubPem);
-        } catch (e) {
-          sigOk = false;
-          sigErr = e?.message || "signature verify failed";
-        }
-      } else {
-        sigOk = false;
-        sigErr = "no public key available (set RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 or pass ens=1 with ETH_RPC_URL)";
-      }
-
-      // SCHEMA VALIDATION: cached-only by default to prevent Railway 502 timeouts.
-      let schemaOk = true;
-      let schemaErrors = null;
-
-      if (wantSchema) {
-        const verb = String(receipt?.x402?.verb || "").trim();
-        if (!verb) {
-          schemaOk = false;
-          schemaErrors = [{ message: "missing receipt.x402.verb" }];
-        } else {
-          const cachedValidate = getValidatorIfCached(verb);
-
-          if (!cachedValidate) {
-            if (VERIFY_SCHEMA_CACHED_ONLY) {
-              // return quickly instead of compiling/fetching refs (prevents 502)
-              return res.status(202).json({
-                ok: false,
-                warming: true,
-                warm_hint: "Call POST /debug/prewarm with this verb, then retry verify?schema=1.",
-                checks: {
-                  schema_valid: false,
-                  hash_matches: hashMatches,
-                  signature_valid: sigOk,
-                },
-                values: {
-                  verb,
-                  signer_id: proof.signer_id ?? null,
-                  alg: proof.alg ?? null,
-                  canonical: proof.canonical ?? null,
-                  claimed_hash: proof.hash_sha256 ?? null,
-                  recomputed_hash: recomputed,
-                  pubkey_source: pubSrc,
-                },
-                errors: {
-                  schema_errors: [{ message: "validator not warmed (cached-only mode)" }],
-                  signature_error: sigErr,
-                },
-                cache: {
-                  validator_cached: false,
-                  cached_verbs: Array.from(validatorCache.keys()),
-                },
-              });
-            }
-
-            // If cached-only is disabled, we *can* try to build on-request (not recommended)
-            try {
-              const validate = await buildValidatorForVerb(verb);
-              const ok = validate(receipt);
-              schemaOk = !!ok;
-              if (!ok) schemaErrors = ajvErrorsToSimple(validate.errors) || [{ message: "schema validation failed" }];
-            } catch (e) {
-              schemaOk = false;
-              schemaErrors = [{ message: e?.message || "schema validation error" }];
-            }
-          } else {
-            const ok = cachedValidate(receipt);
-            schemaOk = !!ok;
-            if (!ok) schemaErrors = ajvErrorsToSimple(cachedValidate.errors) || [{ message: "schema validation failed" }];
-          }
-        }
-      }
-
-      return res.json({
-        ok: hashMatches && sigOk && schemaOk,
-        checks: {
-          schema_valid: schemaOk,
-          hash_matches: hashMatches,
-          signature_valid: sigOk,
-        },
-        values: {
-          verb: receipt?.x402?.verb ?? null,
-          signer_id: proof.signer_id ?? null,
-          alg: proof.alg ?? null,
-          canonical: proof.canonical ?? null,
-          claimed_hash: proof.hash_sha256 ?? null,
-          recomputed_hash: recomputed,
-          pubkey_source: pubSrc,
-        },
-        errors: {
-          schema_errors: schemaErrors,
-          signature_error: sigErr,
-        },
-        cache: wantSchema
-          ? {
-              validator_cached: !!getValidatorIfCached(String(receipt?.x402?.verb || "").trim()),
-              cached_verbs: Array.from(validatorCache.keys()),
-            }
-          : undefined,
-      });
-    } catch (e) {
-      return res.status(500).json({
-        ok: false,
-        error: e?.message || "verify failed",
-        checks: { schema_valid: false, hash_matches: false, signature_valid: false },
-        values: {
-          verb: receipt?.x402?.verb ?? null,
-          signer_id: receipt?.metadata?.proof?.signer_id ?? null,
-          alg: receipt?.metadata?.proof?.alg ?? null,
-          canonical: receipt?.metadata?.proof?.canonical ?? null,
-          claimed_hash: receipt?.metadata?.proof?.hash_sha256 ?? null,
-          recomputed_hash: null,
-          pubkey_source: null,
-        },
-        errors: { schema_errors: null, signature_error: e?.message || "verify failed" },
+        errors: { schema_errors: null, signature_error: "missing metadata.proof.signature_b64 or hash_sha256" },
       });
     }
+
+    // recompute hash
+    const unsigned = structuredClone(receipt);
+    unsigned.metadata.proof.hash_sha256 = "";
+    unsigned.metadata.proof.signature_b64 = "";
+    if (unsigned?.metadata) unsigned.metadata.receipt_id = "";
+    const canonical = stableStringify(unsigned);
+    const recomputed = sha256Hex(canonical);
+    const hashMatches = recomputed === proof.hash_sha256;
+
+    // pubkey
+    let pubPem = pemFromB64(PUB_PEM_B64);
+    let pubSrc = pubPem ? "env-b64" : null;
+
+    if (wantEns) {
+      const ensOut = await fetchEnsPubkeyPem({ refresh });
+      if (ensOut.ok && ensOut.pem) {
+        pubPem = ensOut.pem;
+        pubSrc = "ens";
+      }
+    }
+
+    // signature
+    let sigOk = false;
+    let sigErr = null;
+    if (pubPem) {
+      try {
+        sigOk = verifyEd25519Base64(proof.hash_sha256, proof.signature_b64, pubPem);
+      } catch (e) {
+        sigOk = false;
+        sigErr = e?.message || "signature verify failed";
+      }
+    } else {
+      sigOk = false;
+      sigErr = "no public key available (set RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 or use ens=1 with ETH_RPC_URL)";
+    }
+
+    // schema (edge-safe)
+    let schemaOk = true;
+    let schemaErrors = null;
+
+    if (wantSchema) {
+      schemaOk = false;
+      const verb = String(receipt?.x402?.verb || "").trim();
+
+      if (!verb) {
+        schemaErrors = [{ message: "missing receipt.x402.verb" }];
+      } else if (VERIFY_SCHEMA_CACHED_ONLY && !hasValidatorCached(verb)) {
+        // queue warm and return 202 (never 502)
+        queueWarm([verb]);
+        return res.status(202).json({
+          ok: false,
+          checks: { schema_valid: false, hash_matches: hashMatches, signature_valid: sigOk },
+          values: {
+            verb: receipt?.x402?.verb ?? null,
+            signer_id: proof.signer_id ?? null,
+            alg: proof.alg ?? null,
+            canonical: proof.canonical ?? null,
+            claimed_hash: proof.hash_sha256 ?? null,
+            recomputed_hash: recomputed,
+            pubkey_source: pubSrc,
+          },
+          errors: { schema_errors: [{ message: "validator_not_warmed_yet" }], signature_error: sigErr },
+          retry_after_ms: 1000,
+        });
+      } else {
+        try {
+          const validate = VERIFY_SCHEMA_CACHED_ONLY ? validatorCache.get(verb)?.validate : await getValidatorForVerb(verb);
+          if (!validate) {
+            schemaOk = false;
+            schemaErrors = [{ message: "validator_missing" }];
+          } else {
+            const ok = validate(receipt);
+            schemaOk = !!ok;
+            if (!ok) schemaErrors = ajvErrorsToSimple(validate.errors) || [{ message: "schema validation failed" }];
+          }
+        } catch (e) {
+          schemaOk = false;
+          schemaErrors = [{ message: e?.message || "schema validation error" }];
+        }
+      }
+    }
+
+    return res.json({
+      ok: hashMatches && sigOk && schemaOk,
+      checks: { schema_valid: schemaOk, hash_matches: hashMatches, signature_valid: sigOk },
+      values: {
+        verb: receipt?.x402?.verb ?? null,
+        signer_id: proof.signer_id ?? null,
+        alg: proof.alg ?? null,
+        canonical: proof.canonical ?? null,
+        claimed_hash: proof.hash_sha256 ?? null,
+        recomputed_hash: recomputed,
+        pubkey_source: pubSrc,
+      },
+      errors: { schema_errors: schemaErrors, signature_error: sigErr },
+    });
   })();
 
   try {
@@ -1267,16 +1118,7 @@ app.post("/verify", async (req, res) => {
       ok: false,
       error: e?.message || "verify failed",
       checks: { schema_valid: false, hash_matches: false, signature_valid: false },
-      values: {
-        verb: req.body?.x402?.verb ?? null,
-        signer_id: req.body?.metadata?.proof?.signer_id ?? null,
-        alg: req.body?.metadata?.proof?.alg ?? null,
-        canonical: req.body?.metadata?.proof?.canonical ?? null,
-        claimed_hash: req.body?.metadata?.proof?.hash_sha256 ?? null,
-        recomputed_hash: null,
-        pubkey_source: null,
-      },
-      errors: { schema_errors: [{ message: e?.message || "verify failed" }], signature_error: null },
+      errors: { schema_errors: [{ message: e?.message || "verify_timeout" }], signature_error: null },
     });
   }
 });
