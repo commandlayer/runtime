@@ -158,7 +158,6 @@ function isPrivateIp(ip) {
 }
 
 async function resolveARecords(hostname) {
-  // Avoid extra deps; use global DNS via node's built-in resolver
   const dns = await import("dns/promises");
   try {
     const addrs = await dns.resolve4(hostname);
@@ -261,7 +260,6 @@ function cachePrune(map, { ttlMs, maxEntries, tsField = "fetchedAt" } = {}) {
     }
   }
   if (maxEntries && maxEntries > 0 && map.size > maxEntries) {
-    // delete oldest
     const entries = Array.from(map.entries()).sort((a, b) => {
       const ta = a[1]?.[tsField] || 0;
       const tb = b[1]?.[tsField] || 0;
@@ -278,9 +276,7 @@ function normalizeSchemaFetchUrl(url) {
   u = u.replace(/^http:\/\//i, "https://");
   u = u.replace(/^https:\/\/commandlayer\.org/i, "https://www.commandlayer.org");
   u = u.replace(/^https:\/\/www\.commandlayer\.org\/+/, "https://www.commandlayer.org/");
-  // also honor SCHEMA_HOST if you override it
   if (SCHEMA_HOST.startsWith("https://www.commandlayer.org")) {
-    // ensure schemas fetch from www
     u = u.replace(/^https:\/\/commandlayer\.org/i, "https://www.commandlayer.org");
   }
   return u;
@@ -315,7 +311,6 @@ function makeAjv() {
     allErrors: true,
     strict: false,
     validateSchema: false,
-    // Async loading for $ref
     loadSchema: async (uri) => {
       return await fetchJsonWithTimeout(uri, SCHEMA_FETCH_TIMEOUT_MS);
     },
@@ -325,7 +320,6 @@ function makeAjv() {
 }
 
 function receiptSchemaUrlForVerb(verb) {
-  // receipts are published under /schemas/v1.0.0/commons/<verb>/receipts/<verb>.receipt.schema.json
   return `${SCHEMA_HOST}/schemas/v1.0.0/commons/${verb}/receipts/${verb}.receipt.schema.json`;
 }
 
@@ -376,6 +370,17 @@ function ajvErrorsToSimple(errors) {
     keyword: e.keyword,
     message: e.message,
   }));
+}
+
+// ---- NEW: non-blocking schema warmup helpers
+function getCachedValidator(verb) {
+  const hit = validatorCache.get(verb);
+  return hit?.validate || null;
+}
+
+function warmValidator(verb) {
+  // fire-and-forget; inflightValidator dedupes
+  getValidatorForVerb(verb).catch(() => null);
 }
 
 // -----------------------
@@ -490,12 +495,7 @@ function doDescribe(body) {
   return {
     description,
     bullets,
-    properties: {
-      verb: "describe",
-      version: "1.0.0",
-      audience,
-      detail_level: detail,
-    },
+    properties: { verb: "describe", version: "1.0.0", audience, detail_level: detail },
   };
 }
 
@@ -666,13 +666,7 @@ function doConvert(body) {
     warnings.push(`No deterministic converter for ${src}->${tgt}; echoing content.`);
   }
 
-  return {
-    converted_content: converted,
-    source_format: src,
-    target_format: tgt,
-    lossy,
-    warnings,
-  };
+  return { converted_content: converted, source_format: src, target_format: tgt, lossy, warnings };
 }
 
 function doExplain(body) {
@@ -700,8 +694,7 @@ function doExplain(body) {
 
   let explanation = "";
   if (audience === "novice") {
-    explanation =
-      `**${subject}** are like “tamper-proof receipts” for agent actions.\n\n` + core.map((s) => `- ${s}`).join("\n");
+    explanation = `**${subject}** are like “tamper-proof receipts” for agent actions.\n\n` + core.map((s) => `- ${s}`).join("\n");
   } else {
     explanation =
       `**${subject}** are cryptographically verifiable execution artifacts that bind intent (verb+version), semantics (schema), and output into a signed proof.\n\n` +
@@ -799,11 +792,7 @@ function doClassify(body) {
   const trimmedLabels = labels.slice(0, Math.min(128, maxLabels));
   const trimmedScores = scores.slice(0, trimmedLabels.length);
 
-  return {
-    labels: trimmedLabels,
-    scores: trimmedScores,
-    taxonomy: ["root", trimmedLabels[0] || "general"],
-  };
+  return { labels: trimmedLabels, scores: trimmedScores, taxonomy: ["root", trimmedLabels[0] || "general"] };
 }
 
 // Router: dispatch by verb
@@ -827,10 +816,8 @@ async function handleVerb(verb, req, res) {
   const started = Date.now();
 
   // FIX (schema): only include parent_trace_id if it is a non-empty string.
-  // Published schemas require `trace.parent_trace_id` to be a string when present (not null).
   const rawParent = req.body?.trace?.parent_trace_id ?? req.body?.x402?.extras?.parent_trace_id ?? null;
-  const parentTraceId =
-    typeof rawParent === "string" && rawParent.trim().length ? rawParent.trim() : null;
+  const parentTraceId = typeof rawParent === "string" && rawParent.trim().length ? rawParent.trim() : null;
 
   const trace = {
     trace_id: randId("trace_"),
@@ -845,10 +832,7 @@ async function handleVerb(verb, req, res) {
     const x402 = req.body?.x402 || { verb, version: "1.0.0", entry: `x402://${verb}agent.eth/${verb}/v1.0.0` };
 
     const callerTimeout = Number(req.body?.limits?.timeout_ms || req.body?.limits?.max_latency_ms || 0);
-    const timeoutMs = Math.min(
-      SERVER_MAX_HANDLER_MS,
-      callerTimeout && callerTimeout > 0 ? callerTimeout : SERVER_MAX_HANDLER_MS
-    );
+    const timeoutMs = Math.min(SERVER_MAX_HANDLER_MS, callerTimeout && callerTimeout > 0 ? callerTimeout : SERVER_MAX_HANDLER_MS);
 
     const work = Promise.resolve(handlers[verb](req.body));
     const result = timeoutMs
@@ -949,7 +933,6 @@ app.get("/debug/env", (req, res) => {
     schema_host: SCHEMA_HOST,
     schema_fetch_timeout_ms: SCHEMA_FETCH_TIMEOUT_MS,
     schema_validate_budget_ms: SCHEMA_VALIDATE_BUDGET_MS,
-
     enable_ssrf_guard: ENABLE_SSRF_GUARD,
     fetch_timeout_ms: FETCH_TIMEOUT_MS,
     fetch_max_bytes: FETCH_MAX_BYTES,
@@ -961,7 +944,6 @@ app.get("/debug/env", (req, res) => {
       validator_cache_ttl_ms: VALIDATOR_CACHE_TTL_MS,
     },
     server_max_handler_ms: SERVER_MAX_HANDLER_MS,
-
     service_name: SERVICE_NAME,
     service_version: SERVICE_VERSION,
     api_version: API_VERSION,
@@ -1013,6 +995,42 @@ app.get("/debug/routes", (req, res) => {
     }
   }
   res.json({ ok: true, count: routes.length, routes });
+});
+
+// ---- NEW: JSON-only prewarm endpoint (fixes your jq "invalid numeric literal")
+app.post("/debug/prewarm", async (req, res) => {
+  try {
+    const verbs = Array.isArray(req.body?.verbs) ? req.body.verbs.map((v) => String(v).trim()).filter(Boolean) : [];
+    if (!verbs.length) return res.status(400).json({ ok: false, error: "Body must be { verbs: [...] }" });
+
+    const started = Date.now();
+    const results = await Promise.all(
+      verbs.map(async (verb) => {
+        const cached = !!getCachedValidator(verb);
+        if (cached) return { verb, ok: true, cached: true };
+
+        // start warmup
+        warmValidator(verb);
+
+        // wait briefly (do not hang)
+        const deadline = Date.now() + 1500;
+        while (Date.now() < deadline) {
+          if (getCachedValidator(verb)) return { verb, ok: true, cached: false, warmed: true };
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        return { verb, ok: false, cached: false, warmed: false, note: "warming_in_progress" };
+      })
+    );
+
+    return res.json({
+      ok: true,
+      ms: Date.now() - started,
+      results,
+      cache_sizes: { schemaJsonCache: schemaJsonCache.size, validatorCache: validatorCache.size },
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || "prewarm failed" });
+  }
 });
 
 // -----------------------
@@ -1094,8 +1112,10 @@ app.post("/verify", async (req, res) => {
         sigErr = "no public key available (set RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 or pass ens=1 with ETH_RPC_URL)";
       }
 
+      // ---- CRITICAL FIX: schema=1 must never hang /verify on cold compile
       let schemaOk = true;
       let schemaErrors = null;
+      let warming = false;
 
       if (wantSchema) {
         schemaOk = false;
@@ -1103,20 +1123,28 @@ app.post("/verify", async (req, res) => {
         if (!verb) {
           schemaErrors = [{ message: "missing receipt.x402.verb" }];
         } else {
-          try {
-            const validate = await getValidatorForVerb(verb);
-            const ok = validate(receipt);
-            schemaOk = !!ok;
-            if (!ok) schemaErrors = ajvErrorsToSimple(validate.errors) || [{ message: "schema validation failed" }];
-          } catch (e) {
-            schemaOk = false;
-            schemaErrors = [{ message: e?.message || "schema validation error" }];
+          const cachedValidate = getCachedValidator(verb);
+
+          if (!cachedValidate) {
+            warming = true;
+            warmValidator(verb);
+            schemaErrors = [{ message: `validator cold for verb="${verb}". warming started; retry in ~1s.` }];
+          } else {
+            try {
+              const ok = cachedValidate(receipt);
+              schemaOk = !!ok;
+              if (!ok) schemaErrors = ajvErrorsToSimple(cachedValidate.errors) || [{ message: "schema validation failed" }];
+            } catch (e) {
+              schemaOk = false;
+              schemaErrors = [{ message: e?.message || "schema validation error" }];
+            }
           }
         }
       }
 
       return res.json({
         ok: hashMatches && sigOk && schemaOk,
+        warming,
         checks: {
           schema_valid: schemaOk,
           hash_matches: hashMatches,
