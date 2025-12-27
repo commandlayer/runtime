@@ -68,6 +68,15 @@ const ALLOW_FETCH_HOSTS = (process.env.ALLOW_FETCH_HOSTS || "")
 // verify hardening
 const VERIFY_MAX_MS = Number(process.env.VERIFY_MAX_MS || 8000);
 
+// schema-safe verify behavior:
+// - NEVER compile validators inside /verify (avoids Railway 502 timeouts)
+// - if schema=1 and validator isn't cached yet: return 202 quickly (warming required)
+const VERIFY_SCHEMA_CACHED_ONLY = String(process.env.VERIFY_SCHEMA_CACHED_ONLY || "1") === "1";
+// /debug/prewarm will warm sequentially. Limit verbs and budgets.
+const PREWARM_MAX_VERBS = Number(process.env.PREWARM_MAX_VERBS || 25);
+const PREWARM_TOTAL_BUDGET_MS = Number(process.env.PREWARM_TOTAL_BUDGET_MS || 12000);
+const PREWARM_PER_VERB_BUDGET_MS = Number(process.env.PREWARM_PER_VERB_BUDGET_MS || 5000);
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -158,6 +167,7 @@ function isPrivateIp(ip) {
 }
 
 async function resolveARecords(hostname) {
+  // Avoid extra deps; use global DNS via node's built-in resolver
   const dns = await import("dns/promises");
   try {
     const addrs = await dns.resolve4(hostname);
@@ -260,6 +270,7 @@ function cachePrune(map, { ttlMs, maxEntries, tsField = "fetchedAt" } = {}) {
     }
   }
   if (maxEntries && maxEntries > 0 && map.size > maxEntries) {
+    // delete oldest
     const entries = Array.from(map.entries()).sort((a, b) => {
       const ta = a[1]?.[tsField] || 0;
       const tb = b[1]?.[tsField] || 0;
@@ -323,7 +334,7 @@ function receiptSchemaUrlForVerb(verb) {
   return `${SCHEMA_HOST}/schemas/v1.0.0/commons/${verb}/receipts/${verb}.receipt.schema.json`;
 }
 
-async function getValidatorForVerb(verb) {
+async function buildValidatorForVerb(verb) {
   cachePrune(validatorCache, {
     ttlMs: VALIDATOR_CACHE_TTL_MS,
     maxEntries: MAX_VALIDATOR_CACHE_ENTRIES,
@@ -339,7 +350,7 @@ async function getValidatorForVerb(verb) {
     const ajv = makeAjv();
     const url = receiptSchemaUrlForVerb(verb);
 
-    // Preload shared refs
+    // Preload shared refs (best effort)
     try {
       const shared = [
         `${SCHEMA_HOST}/schemas/v1.0.0/_shared/receipt.base.schema.json`,
@@ -353,6 +364,8 @@ async function getValidatorForVerb(verb) {
 
     const schema = await fetchJsonWithTimeout(url, SCHEMA_FETCH_TIMEOUT_MS);
     const compilePromise = ajv.compileAsync(schema);
+
+    // IMPORTANT: compile can take long. Budget it.
     const validate = await withTimeout(compilePromise, SCHEMA_VALIDATE_BUDGET_MS, "ajv_compile_budget_exceeded");
     validatorCache.set(verb, { compiledAt: Date.now(), validate });
     return validate;
@@ -360,6 +373,16 @@ async function getValidatorForVerb(verb) {
 
   inflightValidator.set(verb, build);
   return await build;
+}
+
+// cached-only check used by /verify
+function getValidatorIfCached(verb) {
+  cachePrune(validatorCache, {
+    ttlMs: VALIDATOR_CACHE_TTL_MS,
+    maxEntries: MAX_VALIDATOR_CACHE_ENTRIES,
+    tsField: "compiledAt",
+  });
+  return validatorCache.get(verb)?.validate || null;
 }
 
 function ajvErrorsToSimple(errors) {
@@ -372,19 +395,8 @@ function ajvErrorsToSimple(errors) {
   }));
 }
 
-// ---- NEW: non-blocking schema warmup helpers
-function getCachedValidator(verb) {
-  const hit = validatorCache.get(verb);
-  return hit?.validate || null;
-}
-
-function warmValidator(verb) {
-  // fire-and-forget; inflightValidator dedupes
-  getValidatorForVerb(verb).catch(() => null);
-}
-
 // -----------------------
-// receipts (FIXED receipt_id hashing)
+// receipts (receipt_id excluded from hash)
 // -----------------------
 function makeReceipt({ x402, trace, result, status = "success", error = null, delegation_result = null, actor = null }) {
   const receipt = {
@@ -402,7 +414,7 @@ function makeReceipt({ x402, trace, result, status = "success", error = null, de
         hash_sha256: null,
         signature_b64: null,
       },
-      receipt_id: "", // IMPORTANT: exists during hashing but blanked
+      receipt_id: "",
     },
   };
 
@@ -411,7 +423,7 @@ function makeReceipt({ x402, trace, result, status = "success", error = null, de
   const unsigned = structuredClone(receipt);
   unsigned.metadata.proof.hash_sha256 = "";
   unsigned.metadata.proof.signature_b64 = "";
-  unsigned.metadata.receipt_id = ""; // exclude receipt_id from canonical hash
+  unsigned.metadata.receipt_id = "";
 
   const canonical = stableStringify(unsigned);
   const hash = sha256Hex(canonical);
@@ -495,7 +507,12 @@ function doDescribe(body) {
   return {
     description,
     bullets,
-    properties: { verb: "describe", version: "1.0.0", audience, detail_level: detail },
+    properties: {
+      verb: "describe",
+      version: "1.0.0",
+      audience,
+      detail_level: detail,
+    },
   };
 }
 
@@ -666,7 +683,13 @@ function doConvert(body) {
     warnings.push(`No deterministic converter for ${src}->${tgt}; echoing content.`);
   }
 
-  return { converted_content: converted, source_format: src, target_format: tgt, lossy, warnings };
+  return {
+    converted_content: converted,
+    source_format: src,
+    target_format: tgt,
+    lossy,
+    warnings,
+  };
 }
 
 function doExplain(body) {
@@ -694,7 +717,8 @@ function doExplain(body) {
 
   let explanation = "";
   if (audience === "novice") {
-    explanation = `**${subject}** are like “tamper-proof receipts” for agent actions.\n\n` + core.map((s) => `- ${s}`).join("\n");
+    explanation =
+      `**${subject}** are like “tamper-proof receipts” for agent actions.\n\n` + core.map((s) => `- ${s}`).join("\n");
   } else {
     explanation =
       `**${subject}** are cryptographically verifiable execution artifacts that bind intent (verb+version), semantics (schema), and output into a signed proof.\n\n` +
@@ -792,7 +816,11 @@ function doClassify(body) {
   const trimmedLabels = labels.slice(0, Math.min(128, maxLabels));
   const trimmedScores = scores.slice(0, trimmedLabels.length);
 
-  return { labels: trimmedLabels, scores: trimmedScores, taxonomy: ["root", trimmedLabels[0] || "general"] };
+  return {
+    labels: trimmedLabels,
+    scores: trimmedScores,
+    taxonomy: ["root", trimmedLabels[0] || "general"],
+  };
 }
 
 // Router: dispatch by verb
@@ -933,6 +961,8 @@ app.get("/debug/env", (req, res) => {
     schema_host: SCHEMA_HOST,
     schema_fetch_timeout_ms: SCHEMA_FETCH_TIMEOUT_MS,
     schema_validate_budget_ms: SCHEMA_VALIDATE_BUDGET_MS,
+    verify_schema_cached_only: VERIFY_SCHEMA_CACHED_ONLY,
+
     enable_ssrf_guard: ENABLE_SSRF_GUARD,
     fetch_timeout_ms: FETCH_TIMEOUT_MS,
     fetch_max_bytes: FETCH_MAX_BYTES,
@@ -944,6 +974,13 @@ app.get("/debug/env", (req, res) => {
       validator_cache_ttl_ms: VALIDATOR_CACHE_TTL_MS,
     },
     server_max_handler_ms: SERVER_MAX_HANDLER_MS,
+
+    prewarm: {
+      max_verbs: PREWARM_MAX_VERBS,
+      total_budget_ms: PREWARM_TOTAL_BUDGET_MS,
+      per_verb_budget_ms: PREWARM_PER_VERB_BUDGET_MS,
+    },
+
     service_name: SERVICE_NAME,
     service_version: SERVICE_VERSION,
     api_version: API_VERSION,
@@ -981,6 +1018,45 @@ app.get("/debug/validators", (req, res) => {
   res.json({
     ok: true,
     cached: Array.from(validatorCache.keys()),
+    inflight: Array.from(inflightValidator.keys()),
+    cache_sizes: { schemaJsonCache: schemaJsonCache.size, validatorCache: validatorCache.size },
+  });
+});
+
+// NEW: sequential prewarm that always returns quickly + never wedges the service
+app.post("/debug/prewarm", async (req, res) => {
+  const started = Date.now();
+  const body = req.body || {};
+  const verbsIn = Array.isArray(body.verbs) ? body.verbs.map((v) => String(v).trim()).filter(Boolean) : [];
+  const verbs = verbsIn.slice(0, PREWARM_MAX_VERBS);
+
+  const results = [];
+  for (const verb of verbs) {
+    // respect total budget
+    if (Date.now() - started > PREWARM_TOTAL_BUDGET_MS) {
+      results.push({ verb, ok: false, warmed: false, error: "prewarm_total_budget_exceeded" });
+      continue;
+    }
+
+    // already cached?
+    if (getValidatorIfCached(verb)) {
+      results.push({ verb, ok: true, warmed: true, cached: true });
+      continue;
+    }
+
+    try {
+      // warm sequentially with per-verb budget
+      await withTimeout(buildValidatorForVerb(verb), PREWARM_PER_VERB_BUDGET_MS, "prewarm_verb_budget_exceeded");
+      results.push({ verb, ok: true, warmed: true, cached: false });
+    } catch (e) {
+      results.push({ verb, ok: false, warmed: false, error: e?.message || "prewarm_failed" });
+    }
+  }
+
+  return res.json({
+    ok: results.every((r) => r.ok),
+    elapsed_ms: Date.now() - started,
+    results,
     cache_sizes: { schemaJsonCache: schemaJsonCache.size, validatorCache: validatorCache.size },
   });
 });
@@ -995,42 +1071,6 @@ app.get("/debug/routes", (req, res) => {
     }
   }
   res.json({ ok: true, count: routes.length, routes });
-});
-
-// ---- NEW: JSON-only prewarm endpoint (fixes your jq "invalid numeric literal")
-app.post("/debug/prewarm", async (req, res) => {
-  try {
-    const verbs = Array.isArray(req.body?.verbs) ? req.body.verbs.map((v) => String(v).trim()).filter(Boolean) : [];
-    if (!verbs.length) return res.status(400).json({ ok: false, error: "Body must be { verbs: [...] }" });
-
-    const started = Date.now();
-    const results = await Promise.all(
-      verbs.map(async (verb) => {
-        const cached = !!getCachedValidator(verb);
-        if (cached) return { verb, ok: true, cached: true };
-
-        // start warmup
-        warmValidator(verb);
-
-        // wait briefly (do not hang)
-        const deadline = Date.now() + 1500;
-        while (Date.now() < deadline) {
-          if (getCachedValidator(verb)) return { verb, ok: true, cached: false, warmed: true };
-          await new Promise((r) => setTimeout(r, 50));
-        }
-        return { verb, ok: false, cached: false, warmed: false, note: "warming_in_progress" };
-      })
-    );
-
-    return res.json({
-      ok: true,
-      ms: Date.now() - started,
-      results,
-      cache_sizes: { schemaJsonCache: schemaJsonCache.size, validatorCache: validatorCache.size },
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || "prewarm failed" });
-  }
 });
 
 // -----------------------
@@ -1078,7 +1118,7 @@ app.post("/verify", async (req, res) => {
       const unsigned = structuredClone(receipt);
       unsigned.metadata.proof.hash_sha256 = "";
       unsigned.metadata.proof.signature_b64 = "";
-      if (unsigned?.metadata) unsigned.metadata.receipt_id = ""; // IMPORTANT: exclude receipt_id
+      if (unsigned?.metadata) unsigned.metadata.receipt_id = "";
       const canonical = stableStringify(unsigned);
       const recomputed = sha256Hex(canonical);
 
@@ -1112,39 +1152,70 @@ app.post("/verify", async (req, res) => {
         sigErr = "no public key available (set RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 or pass ens=1 with ETH_RPC_URL)";
       }
 
-      // ---- CRITICAL FIX: schema=1 must never hang /verify on cold compile
+      // SCHEMA VALIDATION: cached-only by default to prevent Railway 502 timeouts.
       let schemaOk = true;
       let schemaErrors = null;
-      let warming = false;
 
       if (wantSchema) {
-        schemaOk = false;
         const verb = String(receipt?.x402?.verb || "").trim();
         if (!verb) {
+          schemaOk = false;
           schemaErrors = [{ message: "missing receipt.x402.verb" }];
         } else {
-          const cachedValidate = getCachedValidator(verb);
+          const cachedValidate = getValidatorIfCached(verb);
 
           if (!cachedValidate) {
-            warming = true;
-            warmValidator(verb);
-            schemaErrors = [{ message: `validator cold for verb="${verb}". warming started; retry in ~1s.` }];
-          } else {
+            if (VERIFY_SCHEMA_CACHED_ONLY) {
+              // return quickly instead of compiling/fetching refs (prevents 502)
+              return res.status(202).json({
+                ok: false,
+                warming: true,
+                warm_hint: "Call POST /debug/prewarm with this verb, then retry verify?schema=1.",
+                checks: {
+                  schema_valid: false,
+                  hash_matches: hashMatches,
+                  signature_valid: sigOk,
+                },
+                values: {
+                  verb,
+                  signer_id: proof.signer_id ?? null,
+                  alg: proof.alg ?? null,
+                  canonical: proof.canonical ?? null,
+                  claimed_hash: proof.hash_sha256 ?? null,
+                  recomputed_hash: recomputed,
+                  pubkey_source: pubSrc,
+                },
+                errors: {
+                  schema_errors: [{ message: "validator not warmed (cached-only mode)" }],
+                  signature_error: sigErr,
+                },
+                cache: {
+                  validator_cached: false,
+                  cached_verbs: Array.from(validatorCache.keys()),
+                },
+              });
+            }
+
+            // If cached-only is disabled, we *can* try to build on-request (not recommended)
             try {
-              const ok = cachedValidate(receipt);
+              const validate = await buildValidatorForVerb(verb);
+              const ok = validate(receipt);
               schemaOk = !!ok;
-              if (!ok) schemaErrors = ajvErrorsToSimple(cachedValidate.errors) || [{ message: "schema validation failed" }];
+              if (!ok) schemaErrors = ajvErrorsToSimple(validate.errors) || [{ message: "schema validation failed" }];
             } catch (e) {
               schemaOk = false;
               schemaErrors = [{ message: e?.message || "schema validation error" }];
             }
+          } else {
+            const ok = cachedValidate(receipt);
+            schemaOk = !!ok;
+            if (!ok) schemaErrors = ajvErrorsToSimple(cachedValidate.errors) || [{ message: "schema validation failed" }];
           }
         }
       }
 
       return res.json({
         ok: hashMatches && sigOk && schemaOk,
-        warming,
         checks: {
           schema_valid: schemaOk,
           hash_matches: hashMatches,
@@ -1163,6 +1234,12 @@ app.post("/verify", async (req, res) => {
           schema_errors: schemaErrors,
           signature_error: sigErr,
         },
+        cache: wantSchema
+          ? {
+              validator_cached: !!getValidatorIfCached(String(receipt?.x402?.verb || "").trim()),
+              cached_verbs: Array.from(validatorCache.keys()),
+            }
+          : undefined,
       });
     } catch (e) {
       return res.status(500).json({
