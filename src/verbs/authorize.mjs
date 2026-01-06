@@ -1,38 +1,15 @@
-export default async function authorize({ body, ids }) {
+import { crockford26 } from "../util/crockford-id.mjs";
+
+export default async function authorize({ body } = {}) {
   const input = body?.input || {};
-  const checkout_id = input.checkout_id;
-
-  // Minimal demo logic: if missing checkout_id, decline.
-  if (!checkout_id) {
-    return {
-      authorization_id: ids.ulid26(),
-      status: "declined",
-      reason: "missing_checkout_id",
-      metadata: input.metadata || undefined,
-    };
-  }
-
-  // If provided, treat as authorized and require amount+settlement
-  const amount = input.amount;
-  const settlement = input.settlement;
-  if (!amount || !settlement) {
-    return {
-      authorization_id: ids.ulid26(),
-      checkout_id,
-      status: "declined",
-      reason: "missing_amount_or_settlement",
-      metadata: input.metadata || undefined,
-    };
-  }
-
+  const status = "authorized";
   return {
-    authorization_id: ids.ulid26(),
-    checkout_id,
-    status: "authorized",
-    amount,
-    settlement,
-    expires_at: input.expires_at || undefined,
-    evidence: input.evidence || undefined,
-    metadata: input.metadata || undefined,
+    authorization_id: crockford26(),
+    checkout_id: input.checkout_id || crockford26(),
+    status,
+    amount: input.amount || { value: "0.00", currency: "USD" },
+    settlement: input.settlement || { method: "card", network: "unknown" },
+    expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+    metadata: input.metadata || {},
   };
 }

@@ -1,1 +1,3 @@
-import "./src/server.mjs";
+console.log("boot: commercial.server.mjs");
+import { start } from "./src/server.mjs";
+start();

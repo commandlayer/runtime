@@ -1,12 +1,22 @@
 import crypto from "crypto";
 
-// Crockford Base32 alphabet (no I, L, O, U)
+// ULID-ish 26 chars, Crockford Base32 (no I,L,O,U)
 const ALPH = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-// ^[0-9A-HJKMNP-TV-Z]{26}$
 export function crockford26() {
-  const bytes = crypto.randomBytes(26);
+  // 16 bytes -> 26 base32 chars (roughly)
+  const b = crypto.randomBytes(16);
   let out = "";
-  for (let i = 0; i < 26; i++) out += ALPH[bytes[i] % 32];
-  return out;
+  let bits = 0;
+  let val = 0;
+  for (const byte of b) {
+    val = (val << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      out += ALPH[(val >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) out += ALPH[(val << (5 - bits)) & 31];
+  return out.slice(0, 26);
 }

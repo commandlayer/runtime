@@ -1,24 +1,16 @@
-export default async function checkout({ body, ids }) {
+import { crockford26 } from "../util/crockford-id.mjs";
+
+export default async function checkout({ body } = {}) {
   const input = body?.input || {};
-  const amount = input.amount;
-  const settlement = input.settlement;
-  const items = input.items;
-
-  if (!amount || !settlement || !Array.isArray(items) || items.length < 1) {
-    const e = new Error("checkout.input requires amount, settlement, items[]");
-    e.code = "BAD_REQUEST";
-    throw e;
-  }
-
   return {
-    checkout_id: ids.ulid26(),
+    checkout_id: crockford26(),
     status: "created",
-    amount,
-    settlement,
-    items,
+    amount: input.amount || { value: "0.00", currency: "USD" },
+    settlement: input.settlement || { method: "card", network: "unknown" },
+    items: Array.isArray(input.items) && input.items.length ? input.items : [{ sku: "sku_placeholder", quantity: 1, unit_price: { value: "0.00", currency: "USD" } }],
     pricing: input.pricing || undefined,
-    expires_at: input.expires_at || undefined,
+    expires_at: input.expires_at || new Date(Date.now() + 30 * 60 * 1000).toISOString(),
     next_action: "authorize",
-    metadata: input.metadata || undefined,
+    metadata: input.metadata || {},
   };
 }

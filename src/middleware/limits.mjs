@@ -1,61 +1,53 @@
-const state = {
-  day: new Map(),   // key -> { date, count }
-  rps: new Map(),   // key -> { ts, tokens }
-};
+const DEFAULT_DAILY_FREE_CALLS = Number(process.env.DEFAULT_DAILY_FREE_CALLS || 100);
+const DEFAULT_RATE_RPS = Number(process.env.DEFAULT_RATE_RPS || 3);
 
-function dayKey(actor, verb) {
-  return `${actor?.id || "anon"}:${verb}`;
+// ultra-simple in-memory counters (fine for local dev)
+const daily = new Map(); // key -> { day, count }
+const rps = new Map();   // key -> { tsSec, count }
+
+function dayKey() {
+  const d = new Date();
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,"0")}-${String(d.getUTCDate()).padStart(2,"0")}`;
 }
 
-function todayStr() {
-  return new Date().toISOString().slice(0, 10);
+function keyFor(actor, verb) {
+  const a = actor?.id || "anonymous";
+  return `${a}::${verb}`;
 }
 
-export async function applyLimits({ req, verb, pricing, actor }) {
-  const ft = pricing?.free_tier || { calls_per_day: 0, burst_rps: 0 };
-  const key = dayKey(actor, verb);
+export async function applyLimits({ req, verb, pricing, actor } = {}) {
+  const key = keyFor(actor, verb);
 
-  // daily counter
-  const today = todayStr();
-  const cur = state.day.get(key) || { date: today, count: 0 };
-  if (cur.date !== today) {
-    cur.date = today;
-    cur.count = 0;
-  }
+  const burst = Number(pricing?.free_tier?.burst_rps || DEFAULT_RATE_RPS);
+  const freePerDay = Number(pricing?.free_tier?.calls_per_day || DEFAULT_DAILY_FREE_CALLS);
+
+  // RPS
+  const sec = Math.floor(Date.now() / 1000);
+  const cur = rps.get(key) || { tsSec: sec, count: 0 };
+  if (cur.tsSec !== sec) { cur.tsSec = sec; cur.count = 0; }
   cur.count += 1;
-  state.day.set(key, cur);
+  rps.set(key, cur);
 
-  const freeCalls = Number(ft.calls_per_day || 0);
-  const paid = freeCalls > 0 ? cur.count > freeCalls : true;
-
-  // naive RPS (token bucket-ish per second)
-  const burst = Number(ft.burst_rps || 0);
-  if (burst > 0) {
-    const now = Date.now();
-    const sec = Math.floor(now / 1000);
-    const r = state.rps.get(key) || { sec, count: 0 };
-    if (r.sec !== sec) {
-      r.sec = sec;
-      r.count = 0;
-    }
-    r.count += 1;
-    state.rps.set(key, r);
-
-    if (r.count > burst) {
-      const e = new Error("RATE_LIMIT");
-      e.code = "RATE_LIMIT";
-      e.http_status = 429;
-      e.retry_after_ms = 1000;
-      throw e;
-    }
+  if (burst > 0 && cur.count > burst) {
+    const e = new Error("RATE_LIMIT");
+    e.code = "RATE_LIMIT";
+    e.http_status = 429;
+    e.retry_after_ms = 1000;
+    throw e;
   }
 
-  const unitPrice = Number(pricing?.verbs?.[verb]?.unit_price || 0);
-  const currency = String(pricing?.currency || "USD");
+  // daily free tier
+  const day = dayKey();
+  const d = daily.get(key) || { day, count: 0 };
+  if (d.day !== day) { d.day = day; d.count = 0; }
+  d.count += 1;
+  daily.set(key, d);
+
+  const paid = freePerDay > 0 ? d.count > freePerDay : true;
 
   return {
     paid,
-    limits: { calls_per_day: freeCalls, burst_rps: burst, used_today: cur.count },
-    billing: paid ? { provider: "none", amount: String(unitPrice), currency } : null,
+    billing: paid ? { provider: process.env.BILLING_PROVIDER || "none", path: "paid" } : null,
+    limits: { calls_today: d.count, free_calls_per_day: freePerDay, burst_rps: burst },
   };
 }

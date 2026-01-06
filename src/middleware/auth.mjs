@@ -1,9 +1,9 @@
 export function resolveActor(req) {
-  const body = req?.body || {};
-  const actorId = body?.actor ? String(body.actor) : null;
-  const tenantId = body?.x402?.tenant ? String(body.x402.tenant) : null;
+  const bodyActor = req?.body?.actor;
+  if (bodyActor && typeof bodyActor === "string") return { id: bodyActor, role: "user" };
 
-  if (actorId) return { id: actorId, role: "user" };
-  if (tenantId) return { id: tenantId, role: "tenant" };
-  return null;
+  const tenant = req?.body?.x402?.tenant;
+  if (tenant && typeof tenant === "string") return { id: tenant, role: "tenant" };
+
+  return { id: "anonymous", role: "anonymous" };
 }

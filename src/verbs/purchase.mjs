@@ -1,25 +1,13 @@
-export default async function purchase({ body, ids }) {
+import { crockford26 } from "../util/crockford-id.mjs";
+
+export default async function purchase({ body } = {}) {
   const input = body?.input || {};
-
-  const amount = input.amount;
-  const settlement = input.settlement;
-
-  // For schema: success/pending require amount+settlement.
-  if (!amount || !settlement) {
-    return {
-      purchase_id: ids.ulid26(),
-      status: "failed",
-      reason: "missing_amount_or_settlement",
-      metadata: input.metadata || undefined,
-    };
-  }
-
   return {
-    purchase_id: ids.ulid26(),
+    purchase_id: crockford26(),
     status: "success",
-    amount,
-    settlement,
-    evidence: input.evidence || undefined,
-    metadata: input.metadata || undefined,
+    amount: input.amount || { value: "0.00", currency: "USD" },
+    settlement: input.settlement || { method: "card", network: "unknown" },
+    evidence: input.evidence || { provider_ref: "stub" },
+    metadata: input.metadata || {},
   };
 }

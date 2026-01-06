@@ -1,7 +1,22 @@
 import crypto from "crypto";
-import { stableStringify } from "../util/stable-json.mjs";
-import { fetchEnsPubkeyPem } from "./ens.mjs";
-import { getValidatorForVerb, hasValidatorCached, queueWarm, startWarmWorker, ajvErrorsToSimple } from "./schema.mjs";
+
+function stableStringify(value) {
+  const seen = new WeakSet();
+  const helper = (v) => {
+    if (v === null || typeof v !== "object") return v;
+    if (seen.has(v)) return "[Circular]";
+    seen.add(v);
+    if (Array.isArray(v)) return v.map(helper);
+    const out = {};
+    for (const k of Object.keys(v).sort()) out[k] = helper(v[k]);
+    return out;
+  };
+  return JSON.stringify(helper(value));
+}
+
+function sha256Hex(str) {
+  return crypto.createHash("sha256").update(str).digest("hex");
+}
 
 function pemFromB64(b64) {
   if (!b64) return null;
@@ -22,17 +37,7 @@ function verifyEd25519Base64(messageUtf8, signatureB64, pubPem) {
   return crypto.verify(null, Buffer.from(messageUtf8, "utf8"), key, Buffer.from(signatureB64, "base64"));
 }
 
-function sha256Hex(str) {
-  return crypto.createHash("sha256").update(str).digest("hex");
-}
-
-function normalizePem(text) {
-  if (!text) return null;
-  const pem = String(text).replace(/\\n/g, "\n").trim();
-  return pem.includes("BEGIN") ? pem : null;
-}
-
-export function makeReceipt({ signer_id, x402, trace, status = "success", result = null, error = null, actor = null, metadata_patch = null }) {
+export function makeReceipt({ signer_id, x402, trace, result, status = "success", error = null, actor = null, metadata_patch = null } = {}) {
   const receipt = {
     status,
     x402,
@@ -41,16 +46,16 @@ export function makeReceipt({ signer_id, x402, trace, status = "success", result
     ...(status === "success" ? { result } : {}),
     metadata: {
       ...(actor ? { actor } : {}),
-      ...(metadata_patch ? metadata_patch : {}),
+      ...(metadata_patch && typeof metadata_patch === "object" ? metadata_patch : {}),
       proof: {
         alg: "ed25519-sha256",
         canonical: "json-stringify",
-        signer_id,
+        signer_id: signer_id || "runtime",
         hash_sha256: null,
-        signature_b64: null
+        signature_b64: null,
       },
-      receipt_id: ""
-    }
+      receipt_id: "",
+    },
   };
 
   const unsigned = structuredClone(receipt);
@@ -69,13 +74,12 @@ export function makeReceipt({ signer_id, x402, trace, status = "success", result
   return receipt;
 }
 
-makeReceipt.verify = async function verifyReceipt({ receipt, wantEns, refresh, wantSchema, schemaHost }) {
+makeReceipt.verify = async function verify({ receipt, wantEns = false, refresh = false } = {}) {
   const proof = receipt?.metadata?.proof;
   if (!proof?.signature_b64 || !proof?.hash_sha256) {
     return { ok: false, http_status: 400, error: "missing metadata.proof.signature_b64 or hash_sha256" };
   }
 
-  // recompute hash from unsigned receipt
   const unsigned = structuredClone(receipt);
   unsigned.metadata.proof.hash_sha256 = "";
   unsigned.metadata.proof.signature_b64 = "";
@@ -84,11 +88,11 @@ makeReceipt.verify = async function verifyReceipt({ receipt, wantEns, refresh, w
   const recomputed = sha256Hex(canonical);
   const hashMatches = recomputed === proof.hash_sha256;
 
-  // pick pubkey: env or ENS
   let pubPem = pemFromB64(process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "");
   let pubSrc = pubPem ? "env-b64" : null;
 
   if (wantEns) {
+    const { fetchEnsPubkeyPem } = await import("./ens.mjs");
     const ensOut = await fetchEnsPubkeyPem({ refresh });
     if (ensOut.ok && ensOut.pem) {
       pubPem = ensOut.pem;
@@ -96,67 +100,30 @@ makeReceipt.verify = async function verifyReceipt({ receipt, wantEns, refresh, w
     }
   }
 
-  let sigOk = false;
-  let sigErr = null;
-  if (pubPem) {
-    try {
-      sigOk = verifyEd25519Base64(proof.hash_sha256, proof.signature_b64, pubPem);
-    } catch (e) {
-      sigOk = false;
-      sigErr = e?.message || "signature verify failed";
-    }
-  } else {
-    sigErr = "no public key available (set RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 or pass ens=1)";
+  if (!pubPem) {
+    return {
+      ok: false,
+      http_status: 400,
+      checks: { hash_matches: hashMatches, signature_valid: false },
+      values: { recomputed_hash: recomputed, pubkey_source: pubSrc },
+      error: "no public key available (set RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 or use ens=1)",
+    };
   }
 
-  // schema validation (optional; edge-safe behavior belongs in schema.mjs)
-  let schemaOk = true;
-  let schemaErrors = null;
-
-  if (wantSchema) {
-    schemaOk = false;
-    const verb = String(receipt?.x402?.verb || "").trim();
-    if (!verb) {
-      schemaErrors = [{ message: "missing receipt.x402.verb" }];
-    } else if (getValidatorForVerb.cachedOnly() && !hasValidatorCached(verb)) {
-      queueWarm(verb);
-      startWarmWorker();
-      return {
-        ok: false,
-        http_status: 202,
-        retry_after_ms: 1000,
-        checks: { schema_valid: false, hash_matches: hashMatches, signature_valid: sigOk },
-        errors: { schema_errors: [{ message: "validator_not_warmed_yet" }], signature_error: sigErr },
-        values: { verb, claimed_hash: proof.hash_sha256, recomputed_hash: recomputed, pubkey_source: pubSrc }
-      };
-    } else {
-      try {
-        const validate = getValidatorForVerb.cachedOnly() ? getValidatorForVerb.peek(verb) : await getValidatorForVerb(verb, schemaHost);
-        if (!validate) {
-          schemaErrors = [{ message: "validator_missing" }];
-        } else {
-          const ok = validate(receipt);
-          schemaOk = !!ok;
-          if (!ok) schemaErrors = ajvErrorsToSimple(validate.errors) || [{ message: "schema validation failed" }];
-        }
-      } catch (e) {
-        schemaErrors = [{ message: e?.message || "schema validation error" }];
-      }
-    }
+  let sigOk = false;
+  let sigErr = null;
+  try {
+    sigOk = verifyEd25519Base64(proof.hash_sha256, proof.signature_b64, pubPem);
+  } catch (e) {
+    sigOk = false;
+    sigErr = e?.message || "signature verify failed";
   }
 
   return {
-    ok: hashMatches && sigOk && schemaOk,
-    checks: { schema_valid: schemaOk, hash_matches: hashMatches, signature_valid: sigOk },
-    values: {
-      verb: receipt?.x402?.verb ?? null,
-      signer_id: proof.signer_id ?? null,
-      alg: proof.alg ?? null,
-      canonical: proof.canonical ?? null,
-      claimed_hash: proof.hash_sha256 ?? null,
-      recomputed_hash: recomputed,
-      pubkey_source: pubSrc
-    },
-    errors: { schema_errors: schemaErrors, signature_error: sigErr }
+    ok: hashMatches && sigOk,
+    http_status: hashMatches && sigOk ? 200 : 400,
+    checks: { hash_matches: hashMatches, signature_valid: sigOk },
+    values: { recomputed_hash: recomputed, pubkey_source: pubSrc },
+    errors: { signature_error: sigErr },
   };
 };
