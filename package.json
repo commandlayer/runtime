@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.mjs"
+    "start": "node server.mjs",
+    "dev:commercial": "PORT=8090 node commercial.server.mjs"
   },
   "dependencies": {
     "ajv": "^8.0.0",
