@@ -781,8 +781,14 @@ function doAnalyze(body) {
 }
 
 function doClassify(body) {
-  const actor = String(body?.actor ?? "").trim();
+  // Accept both "actor" at top-level (old) and x402.tenant (newer),
+  // but keep deterministic error if neither exists.
+  const actor =
+    String(body?.actor ?? "").trim() ||
+    String(body?.x402?.tenant ?? "").trim();
+
   if (!actor) throw new Error("classify.actor required");
+
   const input = body?.input || {};
   const content = String(input.content ?? "");
   if (!content.trim()) throw new Error("classify.input.content required");
@@ -832,12 +838,43 @@ async function handleVerb(verb, req, res) {
 
   const started = Date.now();
 
-  // Schema legality: only include parent_trace_id if it's a non-empty string
-  const rawParent = req.body?.trace?.parent_trace_id ?? req.body?.x402?.extras?.parent_trace_id ?? null;
-  const parentTraceId = typeof rawParent === "string" && rawParent.trim().length ? rawParent.trim() : null;
+  // -----------------------
+  // TRACE (schema-correct)
+  // - receipt.trace.trace_id        = runtime execution id (minted here)
+  // - receipt.trace.parent_trace_id = upstream/workflow trace id (if provided)
+  //
+  // Accept upstream trace_id from:
+  //   - req.body.trace.trace_id (your composer sends this UUID)
+  //   - req.body.trace_id (legacy)
+  // Accept explicit parent_trace_id from:
+  //   - req.body.trace.parent_trace_id
+  //   - req.body.x402.extras.parent_trace_id (legacy hook)
+  // -----------------------
+  const rawInboundTraceId =
+    req.body?.trace?.trace_id ??
+    req.body?.trace_id ??
+    null;
+
+  const inboundTraceId =
+    typeof rawInboundTraceId === "string" && rawInboundTraceId.trim().length
+      ? rawInboundTraceId.trim()
+      : null;
+
+  const rawExplicitParent =
+    req.body?.trace?.parent_trace_id ??
+    req.body?.x402?.extras?.parent_trace_id ??
+    null;
+
+  const explicitParentTraceId =
+    typeof rawExplicitParent === "string" && rawExplicitParent.trim().length
+      ? rawExplicitParent.trim()
+      : null;
+
+  // Prefer explicit parent_trace_id if present; otherwise treat inbound trace_id as the parent/workflow id.
+  const parentTraceId = explicitParentTraceId || inboundTraceId || null;
 
   const trace = {
-    trace_id: randId("trace_"),
+    trace_id: randId("trace_"), // runtime span/execution id
     ...(parentTraceId ? { parent_trace_id: parentTraceId } : {}),
     started_at: nowIso(),
     completed_at: null,
@@ -849,7 +886,10 @@ async function handleVerb(verb, req, res) {
     const x402 = req.body?.x402 || { verb, version: "1.0.0", entry: `x402://${verb}agent.eth/${verb}/v1.0.0` };
 
     const callerTimeout = Number(req.body?.limits?.timeout_ms || req.body?.limits?.max_latency_ms || 0);
-    const timeoutMs = Math.min(SERVER_MAX_HANDLER_MS, callerTimeout && callerTimeout > 0 ? callerTimeout : SERVER_MAX_HANDLER_MS);
+    const timeoutMs = Math.min(
+      SERVER_MAX_HANDLER_MS,
+      callerTimeout && callerTimeout > 0 ? callerTimeout : SERVER_MAX_HANDLER_MS
+    );
 
     const work = Promise.resolve(handlers[verb](req.body));
     const result = timeoutMs
@@ -1152,9 +1192,7 @@ app.post("/verify", async (req, res) => {
           });
         } else {
           try {
-            const validate = VERIFY_SCHEMA_CACHED_ONLY
-              ? validatorCache.get(verb)?.validate
-              : await getValidatorForVerb(verb);
+            const validate = VERIFY_SCHEMA_CACHED_ONLY ? validatorCache.get(verb)?.validate : await getValidatorForVerb(verb);
 
             if (!validate) {
               schemaOk = false;
