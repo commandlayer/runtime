@@ -423,7 +423,7 @@ function makeReceipt({ x402, trace, result, status = "success", error = null, de
     metadata: {
       proof: {
         alg: "ed25519-sha256",
-        canonical: "json-stringify",
+        canonical: "cl-stable-json-v1", // (CHANGE #2)
         signer_id: SIGNER_ID,
         hash_sha256: null,
         signature_b64: null,
@@ -783,9 +783,7 @@ function doAnalyze(body) {
 function doClassify(body) {
   // Accept both "actor" at top-level (old) and x402.tenant (newer),
   // but keep deterministic error if neither exists.
-  const actor =
-    String(body?.actor ?? "").trim() ||
-    String(body?.x402?.tenant ?? "").trim();
+  const actor = String(body?.actor ?? "").trim() || String(body?.x402?.tenant ?? "").trim();
 
   if (!actor) throw new Error("classify.actor required");
 
@@ -850,25 +848,15 @@ async function handleVerb(verb, req, res) {
   //   - req.body.trace.parent_trace_id
   //   - req.body.x402.extras.parent_trace_id (legacy hook)
   // -----------------------
-  const rawInboundTraceId =
-    req.body?.trace?.trace_id ??
-    req.body?.trace_id ??
-    null;
+  const rawInboundTraceId = req.body?.trace?.trace_id ?? req.body?.trace_id ?? null;
 
   const inboundTraceId =
-    typeof rawInboundTraceId === "string" && rawInboundTraceId.trim().length
-      ? rawInboundTraceId.trim()
-      : null;
+    typeof rawInboundTraceId === "string" && rawInboundTraceId.trim().length ? rawInboundTraceId.trim() : null;
 
-  const rawExplicitParent =
-    req.body?.trace?.parent_trace_id ??
-    req.body?.x402?.extras?.parent_trace_id ??
-    null;
+  const rawExplicitParent = req.body?.trace?.parent_trace_id ?? req.body?.x402?.extras?.parent_trace_id ?? null;
 
   const explicitParentTraceId =
-    typeof rawExplicitParent === "string" && rawExplicitParent.trim().length
-      ? rawExplicitParent.trim()
-      : null;
+    typeof rawExplicitParent === "string" && rawExplicitParent.trim().length ? rawExplicitParent.trim() : null;
 
   // Prefer explicit parent_trace_id if present; otherwise treat inbound trace_id as the parent/workflow id.
   const parentTraceId = explicitParentTraceId || inboundTraceId || null;
@@ -886,10 +874,7 @@ async function handleVerb(verb, req, res) {
     const x402 = req.body?.x402 || { verb, version: "1.0.0", entry: `x402://${verb}agent.eth/${verb}/v1.0.0` };
 
     const callerTimeout = Number(req.body?.limits?.timeout_ms || req.body?.limits?.max_latency_ms || 0);
-    const timeoutMs = Math.min(
-      SERVER_MAX_HANDLER_MS,
-      callerTimeout && callerTimeout > 0 ? callerTimeout : SERVER_MAX_HANDLER_MS
-    );
+    const timeoutMs = Math.min(SERVER_MAX_HANDLER_MS, callerTimeout && callerTimeout > 0 ? callerTimeout : SERVER_MAX_HANDLER_MS);
 
     const work = Promise.resolve(handlers[verb](req.body));
     const result = timeoutMs
